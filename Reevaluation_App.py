@@ -29,8 +29,8 @@ APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
 
 # Performance
-PAGE_SIZE = 2000          # <= as requested: try to bring all records in one shot
-REEVAL_WORKERS = 10       # <= as requested: 10 parallel reevaluate calls
+PAGE_SIZE = 2000          # pull as many as possible in one page (works for 838, and scales for >2000 with paging)
+REEVAL_WORKERS = 10       # concurrent reevaluation calls
 
 # Audit
 AUDIT_DIR = "audit_logs"
@@ -67,6 +67,7 @@ def write_audit(row: Dict[str, Any]):
                 "timestamp_iso", "tenant",
                 "user_id", "entity_id", "entity_type", "request_id",
                 "status", "http_status", "latency_sec", "message", "backend_request_id",
+                "duration_ms"  # per-entity measured time (UI-side)
             ],
         )
         if not exists:
@@ -146,19 +147,26 @@ def extract_entity_ids_from_page(j: Any, expected_type: str) -> List[str]:
         pass
     return ids
 
-# Worker for threaded reevaluation
+# Worker for threaded reevaluation — returns per-entity duration_ms as well
 def reeval_worker(base_url: str, headers: Dict[str, str], iid: str, et: str) -> Dict[str, Any]:
     payload = make_request_payload(iid, et)
     url = f"{base_url}{REEVAL_PATH}"
+
+    # precise per-entity timing on the client side
+    t0 = time.perf_counter()
     j, status, latency = robust_post(url, headers, {"entity": payload["entity"]},
                                      REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+    t1 = time.perf_counter()
+    duration_ms = (t1 - t0) * 1000.0
+
     success = (200 <= status < 300) and bool(j.get("success", True))
     msg = j.get("message") or j.get("error","")
     backend_rid = j.get("requestId") or j.get("backendRequestId") or ""
     return {
         "entityType": et, "id": iid, "httpStatus": status, "success": success,
         "latencySec": round(latency, 2), "message": msg[:200],
-        "backendRequestId": backend_rid, "requestId": payload["requestId"]
+        "backendRequestId": backend_rid, "requestId": payload["requestId"],
+        "duration_ms": round(duration_ms, 1)  # add duration_ms field
     }
 
 # ---------------------------------------------
@@ -252,7 +260,7 @@ if sel_all:
 st.session_state.selected_types = selected
 
 # ---------------------------------------------
-# STEP 4 — Bulk Reevaluation (stream pages + 10 threads)
+# STEP 4 — Bulk Reevaluation (stream pages + 10 threads + exact counts + per-entity time)
 # ---------------------------------------------
 st.subheader("④ Reevaluation")
 btn_reeval = st.button("Start Reevaluation", type="primary",
@@ -277,12 +285,10 @@ if btn_reeval:
     overall = st.progress(0.0)
     status_area = st.empty()
 
-    # Single executor reused across all types
     with ThreadPoolExecutor(max_workers=REEVAL_WORKERS) as pool:
         for et in selected:
             seen_ids: set = set()
             offset = 0
-            page_idx = 0
             processed_this_type = 0
             count_et = None
             if st.session_state.type_counts:
@@ -292,8 +298,7 @@ if btn_reeval:
                     count_et = None
 
             while True:
-                page_idx += 1
-                # Pull one (large) page
+                # Pull a large page (2000)
                 body = {
                     "params": {
                         "query": {"filters": {"typesCriterion": [et]}},
@@ -322,7 +327,7 @@ if btn_reeval:
                 if not new_ids:
                     break
 
-                # Schedule reevaluations in parallel
+                # Schedule reevaluations in parallel (10 workers)
                 futures = [pool.submit(reeval_worker, BASE_URL, headers, iid, et) for iid in new_ids]
 
                 # Consume results as they complete
@@ -330,7 +335,7 @@ if btn_reeval:
                     res = fut.result()
                     results.append(res)
 
-                    # Audit (write in main thread)
+                    # Audit (write in main thread) — include per-entity duration_ms
                     write_audit({
                         "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
                         "tenant": tenant or "",
@@ -343,18 +348,24 @@ if btn_reeval:
                         "latency_sec": f"{res['latencySec']:.2f}",
                         "message": res["message"],
                         "backend_request_id": res.get("backendRequestId") or "",
+                        "duration_ms": f"{res['duration_ms']:.1f}",
                     })
 
-                    processed_this_type += 1
+                    # Exact counters
+                    processed_this_type = len(seen_ids)     # unique processed for this type
                     done += 1
+
+                    # Global progress
                     denom = total_estimated if (counts_available and total_estimated > 0) else max(1, done)
                     overall.progress(min(1.0, done / denom))
-                    # Show per-type progress with a hard cap at count_et if known
-                    display_done = min(processed_this_type, count_et) if count_et else processed_this_type
-                    display_total = count_et if count_et else "?"
-                    status_area.info(f"Reevaluating: {et} — {display_done}/{display_total} (global {done}/{total_estimated or '?'})")
 
-                # Advance offset by HOW MANY THE API RETURNED (not by new_ids only)
+                    # Precise per-type progress text
+                    display_total = count_et if (isinstance(count_et, int) and count_et > 0) else "?"
+                    status_area.info(
+                        f"Reevaluating: {et} — {processed_this_type}/{display_total} (global {done}/{total_estimated or '?'})"
+                    )
+
+                # Advance offset by HOW MANY THE API RETURNED (full page size returned by API)
                 offset += len(ids)
 
                 # STOP when we reached known count
@@ -365,13 +376,23 @@ if btn_reeval:
                 if len(ids) < PAGE_SIZE:
                     break
 
-            st.success(f"[{et}] Completed reevaluation for ~{processed_this_type} entities.")
+            # Per-type completion with exact count + average duration_ms
+            exact_total_for_type = len(seen_ids)
+            durations = [r["duration_ms"] for r in results if r["entityType"] == et]
+            avg_ms = round(sum(durations)/len(durations), 1) if durations else 0.0
+            st.success(f"[{et}] Completed reevaluation for {exact_total_for_type} entities (avg {avg_ms} ms/entity).")
 
     st.success("Reevaluation run complete.")
 
 if results:
-    st.subheader("Run Results")
-    st.dataframe(results, use_container_width=True, hide_index=True)
+    st.subheader("Run Results (includes per-entity time)")
+    # Sort results by entityType for readability
+    results_sorted = sorted(results, key=lambda x: (x["entityType"], x["id"]))
+    st.dataframe(
+        results_sorted,
+        use_container_width=True,
+        hide_index=True
+    )
 
 st.markdown("---")
 st.subheader("Recent Audit Entries (today)")
