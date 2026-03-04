@@ -15,13 +15,13 @@ import streamlit as st
 st.set_page_config(page_title="Entity Reevaluation (Bulk)", page_icon="🔄", layout="wide")
 st.title("🔄 Entity Reevaluation — Single / Multiple / All Types")
 
-# Keep runtime simple (no external deps beyond streamlit/requests)
+# Minimal runtime (Streamlit + Requests only)
 MOCK_MODE = False
 REQUEST_TIMEOUT = 40
 MAX_RETRIES = 3
 BACKOFF_SECONDS = 1.25
 
-# API paths (as per your spec)
+# API paths
 MODEL_GET_PATH = "/api/entitymodelservice/get"
 APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
@@ -65,7 +65,7 @@ def write_audit(row: Dict[str, Any]):
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "timestamp_iso", "tenant", "base_mode", "base_host",
+                "timestamp_iso", "tenant",
                 "user_id", "entity_id", "entity_type", "request_id",
                 "status", "http_status", "latency_sec", "message", "backend_request_id",
             ],
@@ -99,8 +99,7 @@ def robust_post(url: str, headers: Dict[str, str], body: Dict[str, Any],
                 except Exception:
                     return {}, status, time.perf_counter() - start
             if status in (429, 500, 502, 503, 504) and attempt <= max_retries:
-                time.sleep(backoff * attempt)
-                continue
+                time.sleep(backoff * attempt); continue
             return {"error": r.text}, status, time.perf_counter() - start
         except requests.exceptions.Timeout:
             last_status, last_msg = 408, "Request timed out."
@@ -114,49 +113,25 @@ def robust_post(url: str, headers: Dict[str, str], body: Dict[str, Any],
             break
     return {"error": last_msg}, last_status, time.perf_counter() - start
 
-def build_base_url(base_mode: str, http: str, apiurl: str, tenant: str) -> str:
-    """
-    base_mode:
-      - 'api'    -> {{HTTP}}://{{APIURL}}
-      - 'tenant' -> https://{tenant}.syndigo.com
-    """
-    http = (http or "https").rstrip(":/")
-    apiurl = (apiurl or "").strip().rstrip("/")
-    if base_mode == "api":
-        return f"{http}://{apiurl}" if apiurl else ""
-    tenant = (tenant or "").strip()
-    return f"https://{tenant}.syndigo.com" if tenant else ""
-
-# ---- extractors tuned to the sample you shared ----
+# ---- extractors tuned to your API ----
 def find_total_records(j: Any) -> Optional[int]:
     """Fast path for counts: response.totalRecords"""
     try:
         return int(j.get("response", {}).get("totalRecords"))
     except Exception:
-        # Fallback search if structure differs
-        if isinstance(j, dict):
-            for v in j.values():
-                tr = find_total_records(v)
-                if tr is not None:
-                    return tr
-        elif isinstance(j, list):
-            for it in j:
-                tr = find_total_records(it)
-                if tr is not None:
-                    return tr
-    return None
+        return None
 
 def extract_entity_type_names(j: Any) -> List[str]:
     """
-    Extracts type names from response.entities where item.type == "entityType" and 'name' exists.
+    Extracts type names from response.entityModels where item.type == 'entityType' and 'name' exists.
     """
     names: List[str] = []
     seen = set()
     try:
-        entities = j.get("response", {}).get("entities", [])
-        for e in entities:
-            if isinstance(e, dict) and e.get("type") == "entityType":
-                nm = str(e.get("name", "")).strip()
+        models = j.get("response", {}).get("entityModels", [])
+        for m in models:
+            if isinstance(m, dict) and m.get("type") == "entityType":
+                nm = str(m.get("name", "")).strip()
                 if nm and nm not in seen:
                     names.append(nm); seen.add(nm)
     except Exception:
@@ -166,16 +141,6 @@ def extract_entity_type_names(j: Any) -> List[str]:
 def extract_entity_ids(j: Any, expected_type: str) -> List[str]:
     """
     Extract ids from `response.entities` where `type == expected_type`.
-    Sample shape:
-    {
-      "response": {
-        "totalRecords": 838,
-        "entities": [
-          {"id": "...", "type": "tertiarypackaging", ...},
-          ...
-        ]
-      }
-    }
     """
     ids: List[str] = []
     try:
@@ -190,37 +155,23 @@ def extract_entity_ids(j: Any, expected_type: str) -> List[str]:
     return ids
 
 # ---------------------------------------------
-# UI — Connection & Mode
+# SIDEBAR — Connection (tenant only)  ✅ simplified
 # ---------------------------------------------
 with st.sidebar:
     st.header("🔐 Connection")
-    base_mode = st.radio("Base URL mode", ["API host (HTTP+APIURL)", "Tenant subdomain"], index=0)
-    http = st.text_input("HTTP", value="https", help="http or https (used in API-host mode)")
-    apiurl = st.text_input("APIURL", value="", help="e.g., api.mycompany.com (used in API-host mode)")
-    tenant = st.text_input("Tenant (header + subdomain mode)", value="")
-
-    st.divider()
+    tenant = st.text_input("Tenant", value="", placeholder="your-tenant")
     user_id = st.text_input("User ID", value="system")
     client_id = st.text_input("Client ID", value="")
     client_secret = st.text_input("Client Secret", value="", type="password")
 
-    st.caption("In API-host mode we call {{HTTP}}://{{APIURL}}/... endpoints. "
-               "In Tenant-subdomain mode we call https://{tenant}.syndigo.com/...")
-
-# Build base URL
-mode_key = "api" if base_mode.startswith("API") else "tenant"
-BASE_URL = build_base_url(mode_key, http, apiurl, tenant)
+# Build base URL (tenant subdomain only)
+BASE_URL = f"https://{tenant}.syndigo.com" if tenant else ""
 
 # ---------------------------------------------
 # STEP 1 — Discover entity types
 # ---------------------------------------------
 st.subheader("① Discover Entity Types")
-c1, c2 = st.columns([1, 3])
-with c1:
-    btn_fetch_types = st.button("Fetch entity types", type="primary", use_container_width=True,
-                                disabled=not BASE_URL or not client_id or not client_secret)
-with c2:
-    st.write("Calls `/api/entitymodelservice/get` with a filter on `entityType` and extracts type names.")
+btn_fetch_types = st.button("Fetch entity types", type="primary", disabled=not BASE_URL or not client_id or not client_secret)
 
 if "entity_types" not in st.session_state: st.session_state.entity_types = []
 if "type_counts" not in st.session_state: st.session_state.type_counts = {}
@@ -230,6 +181,7 @@ if "ids_by_type" not in st.session_state: st.session_state.ids_by_type = {}
 if btn_fetch_types:
     headers = build_headers(user_id, client_id, client_secret, tenant)
     url = f"{BASE_URL}{MODEL_GET_PATH}"
+    # Your working body for model service (as per your screenshot)
     body = {
         "params": {
             "query": {
@@ -243,25 +195,21 @@ if btn_fetch_types:
     if status >= 400:
         st.error(f"Failed to fetch types (HTTP {status}). {j.get('error','')[:300]}")
     else:
-        names = extract_entity_type_names(j)
-        names = sorted(set(names))
-        if not names:
-            st.warning("No entity types found. If your API returns names under a different path, we can adjust the extractor.")
+        names = sorted(set(extract_entity_type_names(j)))
         st.session_state.entity_types = names
-        st.success(f"Found {len(names)} entity type(s).")
+        if names:
+            st.success(f"Found {len(names)} entity type(s).")
+        else:
+            st.warning("No entity types found.")
 
 if st.session_state.entity_types:
     st.dataframe([{"entityType": n} for n in st.session_state.entity_types], use_container_width=True, hide_index=True)
 
 # ---------------------------------------------
-# STEP 2 — Load counts per entity type
+# STEP 2 — Load counts per entity type  ✅ no delay control
 # ---------------------------------------------
 st.subheader("② Get Counts per Entity Type")
-cols = st.columns([1,1,3])
-with cols[0]:
-    btn_counts = st.button("Load counts", disabled=not st.session_state.entity_types)
-with cols[1]:
-    delay_between_calls = st.number_input("Delay (sec) between count calls", min_value=0.0, max_value=5.0, value=0.1, step=0.1)
+btn_counts = st.button("Load counts", disabled=not st.session_state.entity_types)
 
 if btn_counts:
     headers = build_headers(user_id, client_id, client_secret, tenant)
@@ -274,10 +222,8 @@ if btn_counts:
         if status >= 400:
             counts[et] = {"totalRecords": None, "error": j.get("error","")[:160]}
         else:
-            tr = find_total_records(j)
-            counts[et] = {"totalRecords": tr}
+            counts[et] = {"totalRecords": find_total_records(j)}
         prog.progress(idx / max(1, len(st.session_state.entity_types)))
-        if delay_between_calls > 0: time.sleep(delay_between_calls)
     st.session_state.type_counts = counts
     st.success("Counts loaded.")
 
@@ -287,48 +233,42 @@ if st.session_state.type_counts:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------
-# STEP 3 — Select types & fetch IDs
+# STEP 3 — Select types & fetch IDs  ✅ no per-type/batch inputs
 # ---------------------------------------------
 st.subheader("③ Select Types and Fetch IDs")
-csel1, csel2, csel3, csel4 = st.columns([2,1,1,2])
-with csel1:
-    selected = st.multiselect("Select entity type(s)", st.session_state.entity_types, default=st.session_state.selected_types)
-with csel2:
+left, right = st.columns([2, 1])
+with left:
+    selected = st.multiselect("Select entity type(s)", st.session_state.entity_types,
+                              default=st.session_state.selected_types)
+with right:
     sel_all = st.checkbox("Select all", value=(len(selected)==len(st.session_state.entity_types) and len(selected)>0))
-with csel3:
-    per_type_limit = st.number_input("Max IDs per type", min_value=1, max_value=10000, value=100, step=50)
-with csel4:
-    page_size = st.number_input("Fetch batch size", min_value=10, max_value=2000, value=500, step=50,
-                                help="Sent as options.maxRecords; pagination via options.offset.")
 
 if sel_all:
     selected = st.session_state.entity_types[:]
 st.session_state.selected_types = selected
 
-cbtn1, _ = st.columns([1,4])
-with cbtn1:
-    btn_fetch_ids = st.button("Fetch IDs", type="primary", disabled=not selected)
+btn_fetch_ids = st.button("Fetch IDs", type="primary", disabled=not selected)
 
-def fetch_ids_for_type(base_url: str, headers: Dict[str, str], entity_type: str,
-                       wanted: int, batch: int) -> List[str]:
+def fetch_ids_for_type(base_url: str, headers: Dict[str, str], entity_type: str, wanted: Optional[int]) -> List[str]:
     """
-    Page through /api/entityappservice/get, collecting IDs from response.entities.
-    Stops when:
-      - we've collected `wanted` IDs, or
-      - a page returns 0 entities, or
-      - last page has fewer than requested.
+    Page through /api/entityappservice/get and collect IDs from response.entities.
+    Uses options.maxRecords + options.offset internally. If 'wanted' is None, tries to fetch all.
     """
     got: List[str] = []
     offset = 0
+    page_size = 500  # fixed batch size (UI control removed)
+    target = wanted if (isinstance(wanted, int) and wanted > 0) else None
 
-    while len(got) < wanted:
-        take = min(batch, wanted - len(got))
+    while True:
+        take = page_size if (target is None) else min(page_size, max(0, target - len(got)))
+        if target is not None and take == 0:
+            break
+
         body = {
             "params": {
                 "query": {"filters": {"typesCriterion": [entity_type]}},
-                # Keep fields lean if your API accepts; adjust to your contract if needed
                 "fields": {"attributes": ["_ALL"]},
-                "options": {"maxRecords": int(take), "offset": int(offset)}
+                "options": {"maxRecords": int(take or page_size), "offset": int(offset)}
             }
         }
         url = f"{base_url}{APP_GET_PATH}"
@@ -338,32 +278,37 @@ def fetch_ids_for_type(base_url: str, headers: Dict[str, str], entity_type: str,
 
         ids = extract_entity_ids(j, entity_type)
         if not ids:
-            # no more data
             break
 
-        # append unique
         for iid in ids:
             if iid not in got:
                 got.append(iid)
 
-        # Advance offset by what the API actually returned
         offset += len(ids)
+        if target is None:
+            # try to detect end: if fewer than requested arrived, stop
+            if len(ids) < (take or page_size):
+                break
+        else:
+            if len(got) >= target:
+                break
 
-        # If API returned fewer than we asked, we've hit the end
-        if len(ids) < take:
-            break
-
-    return got[:wanted]
+    return got if target is None else got[:target]
 
 if btn_fetch_ids:
     if not BASE_URL:
-        st.error("Base URL is not configured.")
+        st.error("Tenant is required.")
         st.stop()
     headers = build_headers(user_id, client_id, client_secret, tenant)
+
+    # If counts are available, fetch exactly that many per selected type; else fetch first page only
     ids_by_type: Dict[str, List[str]] = {}
     prog = st.progress(0.0)
     for idx, et in enumerate(selected, start=1):
-        ids = fetch_ids_for_type(BASE_URL, headers, et, per_type_limit, page_size)
+        wanted = None
+        if st.session_state.type_counts and st.session_state.type_counts.get(et, {}).get("totalRecords"):
+            wanted = int(st.session_state.type_counts[et]["totalRecords"])
+        ids = fetch_ids_for_type(BASE_URL, headers, et, wanted=wanted)
         ids_by_type[et] = ids
         prog.progress(idx / max(1, len(selected)))
     st.session_state.ids_by_type = ids_by_type
@@ -379,10 +324,9 @@ if st.session_state.ids_by_type:
     st.caption(f"Total IDs fetched across selection: **{total_ids}**")
 
 # ---------------------------------------------
-# STEP 4 — Bulk Reevaluation
+# STEP 4 — Bulk Reevaluation  ✅ unchanged logic
 # ---------------------------------------------
 st.subheader("④ Reevaluation")
-rate_delay = st.number_input("Delay (sec) between reevaluate calls", min_value=0.0, max_value=5.0, value=0.1, step=0.1)
 btn_reeval = st.button("Start Reevaluation", type="secondary",
                        disabled=(not st.session_state.ids_by_type or not BASE_URL or not client_id or not client_secret))
 
@@ -398,7 +342,8 @@ if btn_reeval:
         for iid in ids:
             payload = make_request_payload(iid, et)
             url = f"{BASE_URL}{REEVAL_PATH}"
-            j, status, latency = robust_post(url, headers, {"entity": payload["entity"]}, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+            j, status, latency = robust_post(url, headers, {"entity": payload["entity"]},
+                                             REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
             success = (200 <= status < 300) and bool(j.get("success", True))
             msg = j.get("message") or j.get("error","")
             backend_rid = j.get("requestId") or j.get("backendRequestId") or ""
@@ -412,8 +357,6 @@ if btn_reeval:
             write_audit({
                 "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
                 "tenant": tenant or "",
-                "base_mode": mode_key,
-                "base_host": f"{http}://{apiurl}" if mode_key == "api" else f"{tenant}.syndigo.com",
                 "user_id": user_id or "system",
                 "entity_id": iid,
                 "entity_type": et,
@@ -428,7 +371,6 @@ if btn_reeval:
             done += 1
             prog.progress(done / max(1, jobs))
             status_area.info(f"Processed {done}/{jobs}: {et} / {iid} — {'✅' if success else '❌'}")
-            if rate_delay > 0: time.sleep(rate_delay)
 
     st.success("Reevaluation run complete.")
 
