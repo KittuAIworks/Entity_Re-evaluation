@@ -2,304 +2,265 @@ import os
 import time
 import csv
 import uuid
+import re
 import datetime as dt
-from typing import Dict, Any, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Any, Tuple
+
 import requests
 import streamlit as st
 
-# ---------------------------------------------------------
+# ---------------------------------------------
 # APP CONFIG
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="Entity Re-evaluation (Bulk)",
-    page_icon="🔄",
-    layout="wide"
-)
-st.title("🔄 Entity Re-evaluation — Single / Multiple / All Types")
+# ---------------------------------------------
+st.set_page_config(page_title="Entity Reevaluation", page_icon="🔄", layout="centered")
+st.title("🔄 Entity Reevaluation")
 
+MOCK_MODE = False
 REQUEST_TIMEOUT = 40
 MAX_RETRIES = 3
-BACKOFF = 1.25
-PAGE_SIZE = 1000          # SAFE VALUE (your backend previously worked with this)
-REEVAL_WORKERS = 10
+BACKOFF_SECONDS = 1.25
 
-MODEL_GET_PATH = "/api/entitymodelservice/get"
-APP_GET_PATH   = "/api/entityappservice/get"
-REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
-
+REEVALUATE_PATH = "/api/entitygovernservice/reevaluate"
 AUDIT_DIR = "audit_logs"
 os.makedirs(AUDIT_DIR, exist_ok=True)
 
-
-# ---------------------------------------------------------
+# ---------------------------------------------
 # HELPERS
-# ---------------------------------------------------------
-def build_headers(uid, cid, secret, tenant):
-    return {
+# ---------------------------------------------
+def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str = "") -> Dict[str, str]:
+    headers = {
         "Content-Type": "application/json",
         "x-rdp-version": "8.1",
         "x-rdp-clientId": "rdpclient",
-        "x-rdp-userId": uid or "system",
-        "auth-client-id": cid,
-        "auth-client-secret": secret,
+        "x-rdp-userId": user_id or "system",
+        "auth-client-id": client_id,
+        "auth-client-secret": client_secret,
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "x-tenant-id": tenant
     }
+    if tenant:
+        headers["x-tenant-id"] = tenant
+    return headers
 
+def sanitize_entity_id(entity_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_:\-\.]", "", (entity_id or "").strip())
 
-def post_json(url, headers, body):
-    start = time.perf_counter()
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-            return r.json(), r.status_code, time.perf_counter() - start
-        except Exception as e:
-            if attempt == MAX_RETRIES:
-                return {"error": str(e)}, 520, 0
-            time.sleep(BACKOFF * (attempt + 1))
+def audit_path_today() -> str:
+    return os.path.join(AUDIT_DIR, f"reevaluate_audit_{dt.datetime.now().strftime('%Y%m%d')}.csv")
 
-
-def write_audit(row):
-    path = os.path.join(AUDIT_DIR, f"audit_{dt.datetime.now().strftime('%Y%m%d')}.csv")
-    new = not os.path.exists(path)
+def write_audit(row: Dict[str, Any]):
+    path = audit_path_today()
+    exists = os.path.isfile(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "timestamp", "tenant", "entity_id", "entity_type", "status",
-            "http_status", "latency", "message", "request_id"
-        ])
-        if new:
-            w.writeheader()
-        w.writerow(row)
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "timestamp_iso",
+                "tenant",
+                "user_id",
+                "entity_id",
+                "entity_type",
+                "request_id",
+                "status",
+                "http_status",
+                "latency_sec",
+                "message",
+                "backend_request_id",
+            ],
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
+def read_recent_audit(n: int = 20):
+    path = audit_path_today()
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    return rows[-n:]
 
-def extract_types(j):
-    out = []
-    for m in j.get("response", {}).get("entityModels", []):
-        if m.get("type") == "entityType":
-            out.append(m.get("name", ""))
-    return out
-
-
-def extract_ids(j, etype):
-    out = []
-    for e in j.get("response", {}).get("entities", []):
-        if e.get("type") == etype and "id" in e:
-            out.append(str(e["id"]).strip())
-    return out
-
-
-def fmt(seconds):
-    s = int(seconds)
-    return f"{s//60}m {s%60}s"
-
-
-# ---------------------------------------------------------
-# OFFSET PAGER — Your previously working logic
-# ---------------------------------------------------------
-def fetch_all_ids(base, headers, etype):
-    all_ids = []
-    offset = 0
-    while True:
-        body = {
-            "params": {
-                "query": {"filters": {"typesCriterion": [etype]}},
-                "fields": {"attributes": ["_ALL"]},
-                "options": {"maxRecords": PAGE_SIZE, "offset": offset}
-            }
-        }
-        j, s, _ = post_json(f"{base}{APP_GET_PATH}", headers, body)
-        if s >= 400:
-            break
-
-        ids = extract_ids(j, etype)
-        if not ids:
-            break
-
-        all_ids.extend(ids)
-        offset += len(ids)
-
-        if len(ids) < PAGE_SIZE:
-            break
-
-    # remove duplicates, preserve order
-    return list(dict.fromkeys(all_ids))
-
-
-# ---------------------------------------------------------
-# Worker
-# ---------------------------------------------------------
-def reeval_worker(base, headers, iid, et):
-    body = {"entity": {"id": iid, "type": et}}
-    j, s, lat = post_json(f"{base}{REEVAL_PATH}", headers, body)
-
-    success = (200 <= s < 300) and bool(j.get("success", True))
-    msg = j.get("message") or j.get("error", "")
-
+def make_request_payload(entity_id: str, entity_type: str) -> Dict[str, Any]:
     return {
-        "id": iid,
-        "success": success,
-        "latency": round(lat, 2),
-        "http": s,
-        "msg": msg,
-        "request_id": str(uuid.uuid4())
+        "entity": {"id": entity_id, "type": entity_type},
+        "requestId": str(uuid.uuid4())
     }
 
+# ---------------------------------------------
+# Backend client
+# ---------------------------------------------
+class BackendClient:
+    def __init__(self, timeout: int = 40, mock: bool = False):
+        self.timeout = timeout
+        self.mock = mock
 
-# ---------------------------------------------------------
-# SIDEBAR
-# ---------------------------------------------------------
-with st.sidebar:
-    st.header("🔐 Connection")
-    tenant = st.text_input("Tenant", "")
-    user_id = st.text_input("User ID", "system")
-    cid = st.text_input("Client ID", "")
-    secret = st.text_input("Client Secret", "", type="password")
+    def reevaluate(
+        self,
+        tenant: str,
+        payload: Dict[str, Any],
+        user_id: str,
+        client_id: str,
+        client_secret: str,
+        max_retries: int = 3,
+        backoff_seconds: float = 1.25,
+    ) -> Tuple[Dict[str, Any], int, float]:
+        """
+        POST https://{tenant}.syndigo.com/api/entitygovernservice/reevaluate
+        """
+        start = time.perf_counter()
 
-BASE_URL = f"https://{tenant}.syndigo.com" if tenant else ""
+        if self.mock:
+            time.sleep(0.2)
+            latency = time.perf_counter() - start
+            return {
+                "success": True,
+                "message": f"[MOCK] Reevaluate accepted for {payload['entity'].get('id')} ({payload['entity'].get('type')})",
+                "backendRequestId": f"mock-{uuid.uuid4()}",
+                "data": {"echo": payload},
+            }, 200, latency
 
+        if not tenant:
+            return {"success": False, "message": "Tenant not provided."}, 400, time.perf_counter() - start
 
-# ---------------------------------------------------------
-# STEP 1 — Discover types
-# ---------------------------------------------------------
-st.subheader("① Discover Entity Types")
-bt1 = st.button("Fetch entity types", type="primary",
-                disabled=not BASE_URL or not cid or not secret)
+        url = f"https://{tenant}.syndigo.com{REEVALUATE_PATH}"
+        headers = build_headers(user_id=user_id, client_id=client_id, client_secret=client_secret, tenant=tenant)
 
-if "types" not in st.session_state:
-    st.session_state.types = []
+        attempt = 0
+        last_status = 0
+        last_message = ""
 
-if bt1:
-    h = build_headers(user_id, cid, secret, tenant)
-    j, s, _ = post_json(f"{BASE_URL}{MODEL_GET_PATH}", h, {
-        "params": {
-            "query": {
-                "domain": "thing",
-                "filters": {"typesCriterion": ["entityType"]}
-            }
-        }
-    })
-    st.session_state.types = extract_types(j)
-    st.success(f"Found {len(st.session_state.types)} types")
-
-if st.session_state.types:
-    st.write(st.session_state.types)
-
-
-# ---------------------------------------------------------
-# STEP 2 — Counts
-# ---------------------------------------------------------
-st.subheader("② Get Counts")
-bt2 = st.button("Load counts", disabled=not st.session_state.types)
-
-if "counts" not in st.session_state:
-    st.session_state.counts = {}
-
-if bt2:
-    h = build_headers(user_id, cid, secret, tenant)
-    out = {}
-    prog = st.progress(0.0)
-    for i, et in enumerate(st.session_state.types, 1):
-        j, s, _ = post_json(
-            f"{BASE_URL}{APP_GET_PATH}",
-            h,
-            {"params": {"query": {"filters": {"typesCriterion": [et]}}}}
-        )
-        out[et] = j.get("response", {}).get("totalRecords")
-        prog.progress(i / len(st.session_state.types))
-    st.session_state.counts = out
-    st.success("Counts loaded")
-
-if st.session_state.counts:
-    st.dataframe(
-        [{"entityType": et, "totalRecords": st.session_state.counts.get(et)}
-         for et in st.session_state.types],
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ---------------------------------------------------------
-# STEP 3 — Select types (with SAFE DEFAULT FIX)
-# ---------------------------------------------------------
-st.subheader("③ Select Types")
-
-# SAFE: remove defaults that are not valid options
-valid_types = st.session_state.types
-old_defaults = st.session_state.get("selected_types", [])
-clean_defaults = [x for x in old_defaults if x in valid_types]
-st.session_state.selected_types = clean_defaults
-
-selected = st.multiselect(
-    "Select entity type(s)",
-    valid_types,
-    default=clean_defaults
-)
-
-st.session_state.selected_types = selected
-
-
-# ---------------------------------------------------------
-# STEP 4 — Re-evaluation
-# ---------------------------------------------------------
-st.subheader("④ Re-evaluation")
-bt3 = st.button("Start Re-evaluation",
-                type="primary",
-                disabled=not selected or not BASE_URL)
-
-results = []
-
-if bt3:
-    h = build_headers(user_id, cid, secret, tenant)
-
-    expected_global = sum(st.session_state.counts.get(et, 0) or 0 for et in selected)
-    overall = st.progress(0.0)
-    status = st.empty()
-    done_global = 0
-
-    with ThreadPoolExecutor(max_workers=REEVAL_WORKERS) as pool:
-        for et in selected:
-            t0 = time.perf_counter()
-
-            # ---- Your original working logic ----
-            ids = fetch_all_ids(BASE_URL, h, et)
-            total = len(ids)
-
-            status.info(f"Re-evaluating: {et} — 0/{total} (global {done_global}/{expected_global})")
-
-            futures = [pool.submit(reeval_worker, BASE_URL, h, iid, et) for iid in ids]
-
-            processed = 0
-
-            for fut in as_completed(futures):
-                res = fut.result()
-                results.append(res)
-
-                write_audit({
-                    "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-                    "tenant": tenant,
-                    "entity_id": res["id"],
-                    "entity_type": et,
-                    "status": "success" if res["success"] else "failure",
-                    "http_status": res["http"],
-                    "latency": res["latency"],
-                    "message": res["msg"],
-                    "request_id": res["request_id"]
-                })
-
-                processed += 1
-                done_global += 1
-
-                overall.progress(min(1.0, done_global / max(1, expected_global)))
-
-                status.info(
-                    f"Re-evaluating: {et} — {processed}/{total} "
-                    f"(global {done_global}/{expected_global})"
+        while attempt <= max_retries:
+            attempt += 1
+            try:
+                r = requests.post(
+                    url,
+                    headers=headers,
+                    json={"entity": payload["entity"]},  # only the required body
+                    timeout=self.timeout,
                 )
+                last_status = r.status_code
 
-            elapsed = time.perf_counter() - t0
-            st.success(f"[{et}] Completed {processed} entities in {fmt(elapsed)}.")
+                if 200 <= r.status_code < 300:
+                    try:
+                        body = r.json()
+                    except Exception:
+                        body = {"success": True, "message": "Reevaluate accepted"}
+                    latency = time.perf_counter() - start
+                    return body, r.status_code, latency
 
-    st.success("Re-evaluation complete.")
-    st.dataframe(results, use_container_width=True, hide_index=True)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_message = f"Retryable error {r.status_code}: {r.text[:300]}"
+                    if attempt <= max_retries:
+                        time.sleep(backoff_seconds * attempt)
+                        continue
+
+                last_message = f"Backend error {r.status_code}: {r.text[:300]}"
+                break
+
+            except requests.exceptions.Timeout:
+                last_status = 408
+                last_message = "Request timed out."
+                if attempt <= max_retries:
+                    time.sleep(backoff_seconds * attempt)
+                    continue
+                break
+            except requests.exceptions.RequestException as e:
+                last_status = 520
+                last_message = f"Request exception: {str(e)}"
+                if attempt <= max_retries:
+                    time.sleep(backoff_seconds * attempt)
+                    continue
+                break
+
+        latency = time.perf_counter() - start
+        return {"success": False, "message": last_message}, last_status, latency
+
+# ---------------------------------------------
+# UI
+# ---------------------------------------------
+with st.form("reeval_form", clear_on_submit=False):
+    st.subheader("🔐 Connection Details")
+    tenant = st.text_input("Tenant", value="", placeholder="your-tenant")
+    user_id = st.text_input("User ID", value="system", help="Defaults to 'system'")
+    client_id = st.text_input("Client ID", value="")
+    client_secret = st.text_input("Client Secret", value="", type="password")
+
+    st.subheader("🧩 Entity")
+    entity_type = st.text_input("Entity Type", placeholder="e.g., PRODUCT")
+    entity_id = st.text_input("Entity ID", placeholder="e.g., PRD-12345")
+
+    submitted = st.form_submit_button("Reevaluate", type="primary")
+
+if submitted:
+    if not tenant or not client_id or not client_secret:
+        st.error("Please provide Tenant, Client ID, and Client Secret.")
+        st.stop()
+
+    clean_id = sanitize_entity_id(entity_id)
+    clean_type = (entity_type or "").strip()
+    if not clean_id or not clean_type:
+        st.error("Both Entity ID and Entity Type are required.")
+        st.stop()
+
+    req_payload = make_request_payload(clean_id, clean_type)
+    client = BackendClient(timeout=REQUEST_TIMEOUT, mock=MOCK_MODE)
+
+    with st.spinner("Contacting backend..."):
+        body, http_status, latency = client.reevaluate(
+            tenant=tenant.strip(),
+            payload=req_payload,
+            user_id=(user_id or "system").strip() or "system",
+            client_id=client_id.strip(),
+            client_secret=client_secret.strip(),
+            max_retries=MAX_RETRIES,
+            backoff_seconds=BACKOFF_SECONDS,
+        )
+
+    success = bool(body.get("success", 200 <= http_status < 300))
+    message = body.get("message", "")
+    backend_req_id = body.get("requestId") or body.get("backendRequestId") or ""
+
+    if success:
+        st.success(f"✅ Reevaluate accepted. (HTTP {http_status}, {latency:.2f}s)")
+    else:
+        st.error(f"❌ Reevaluate failed. (HTTP {http_status}, {latency:.2f}s)")
+
+    with st.expander("Response details"):
+        st.json({
+            "httpStatus": http_status,
+            "latencySec": round(latency, 2),
+            "message": message,
+            "backendRequestId": backend_req_id,
+            "data": body.get("data"),
+            "request": req_payload,
+            "headersUsed": {
+                "x-rdp-version": "8.1",
+                "x-rdp-clientId": "rdpclient",
+                "x-rdp-userId": (user_id or 'system'),
+                "auth-client-id": client_id,
+                "auth-client-secret": "***masked***",
+                "x-tenant-id": tenant or None,
+            }
+        })
+
+    write_audit({
+        "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
+        "tenant": tenant or "",
+        "user_id": user_id or "system",
+        "entity_id": req_payload["entity"]["id"],
+        "entity_type": req_payload["entity"]["type"],
+        "request_id": req_payload["requestId"],
+        "status": "success" if success else "failure",
+        "http_status": http_status,
+        "latency_sec": f"{latency:.2f}",
+        "message": message,
+        "backend_request_id": backend_req_id,
+    })
+
+st.markdown("---")
+st.markdown("### Recent Activity (today)")
+recent = read_recent_audit(20)
+if recent:
+    st.dataframe(recent, use_container_width=True, hide_index=True)
+else:
+    st.info("No activity yet today.")
