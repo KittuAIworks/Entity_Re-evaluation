@@ -29,7 +29,7 @@ APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
 
 # Performance
-PAGE_SIZE = 2000          # pull as many as possible in one page (works for 838, and scales for >2000 with paging)
+PAGE_SIZE = 2000          # fetch large pages (works for <=2000 in one call; multi-page for >2000)
 REEVAL_WORKERS = 10       # concurrent reevaluation calls
 
 # Audit
@@ -67,7 +67,6 @@ def write_audit(row: Dict[str, Any]):
                 "timestamp_iso", "tenant",
                 "user_id", "entity_id", "entity_type", "request_id",
                 "status", "http_status", "latency_sec", "message", "backend_request_id",
-                "duration_ms"  # per-entity measured time (UI-side)
             ],
         )
         if not exists:
@@ -147,26 +146,27 @@ def extract_entity_ids_from_page(j: Any, expected_type: str) -> List[str]:
         pass
     return ids
 
-# Worker for threaded reevaluation — returns per-entity duration_ms as well
+def fmt_hms(seconds: float) -> str:
+    """Format seconds -> 'HH:MM:SS.mmm'"""
+    ms = int((seconds - int(seconds)) * 1000)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+# Worker for threaded reevaluation
 def reeval_worker(base_url: str, headers: Dict[str, str], iid: str, et: str) -> Dict[str, Any]:
     payload = make_request_payload(iid, et)
     url = f"{base_url}{REEVAL_PATH}"
-
-    # precise per-entity timing on the client side
-    t0 = time.perf_counter()
     j, status, latency = robust_post(url, headers, {"entity": payload["entity"]},
                                      REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-    t1 = time.perf_counter()
-    duration_ms = (t1 - t0) * 1000.0
-
     success = (200 <= status < 300) and bool(j.get("success", True))
     msg = j.get("message") or j.get("error","")
     backend_rid = j.get("requestId") or j.get("backendRequestId") or ""
     return {
         "entityType": et, "id": iid, "httpStatus": status, "success": success,
         "latencySec": round(latency, 2), "message": msg[:200],
-        "backendRequestId": backend_rid, "requestId": payload["requestId"],
-        "duration_ms": round(duration_ms, 1)  # add duration_ms field
+        "backendRequestId": backend_rid, "requestId": payload["requestId"]
     }
 
 # ---------------------------------------------
@@ -260,7 +260,7 @@ if sel_all:
 st.session_state.selected_types = selected
 
 # ---------------------------------------------
-# STEP 4 — Bulk Reevaluation (stream pages + 10 threads + exact counts + per-entity time)
+# STEP 4 — Bulk Reevaluation (stream pages + 10 threads + accurate counts + per-type total time)
 # ---------------------------------------------
 st.subheader("④ Reevaluation")
 btn_reeval = st.button("Start Reevaluation", type="primary",
@@ -270,7 +270,7 @@ results: List[Dict[str, Any]] = []
 if btn_reeval:
     headers = build_headers(user_id, client_id, client_secret, tenant)
 
-    # Get total estimated jobs (if counts loaded)
+    # Total estimated jobs (if counts loaded)
     total_estimated = 0
     counts_available = True
     for et in selected:
@@ -287,8 +287,11 @@ if btn_reeval:
 
     with ThreadPoolExecutor(max_workers=REEVAL_WORKERS) as pool:
         for et in selected:
+            per_type_t0 = time.perf_counter()  # <-- start timer for this entity type
+
             seen_ids: set = set()
             offset = 0
+            page_number = 1
             processed_this_type = 0
             count_et = None
             if st.session_state.type_counts:
@@ -298,18 +301,22 @@ if btn_reeval:
                     count_et = None
 
             while True:
-                # Pull a large page (2000)
+                # Pull a large page (2000) using BOTH pageNumber and offset to handle backends that ignore one of them
                 body = {
                     "params": {
                         "query": {"filters": {"typesCriterion": [et]}},
                         "fields": {"attributes": ["_ALL"]},
-                        "options": {"maxRecords": PAGE_SIZE, "offset": offset}
+                        "options": {
+                            "maxRecords": PAGE_SIZE,
+                            "pageNumber": page_number,   # try pageNumber-based paging
+                            "offset": offset             # keep offset for back-compat backends
+                        }
                     }
                 }
                 url = f"{BASE_URL}{APP_GET_PATH}"
                 j, status, _ = robust_post(url, headers, body, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
                 if status >= 400:
-                    status_area.error(f"[{et}] Failed to fetch page offset={offset} (HTTP {status}). {j.get('error','')[:160]}")
+                    status_area.error(f"[{et}] Failed to fetch page #{page_number} (offset={offset}) — HTTP {status}. {j.get('error','')[:160]}")
                     break
 
                 ids = extract_entity_ids_from_page(j, et)
@@ -318,14 +325,30 @@ if btn_reeval:
                 if not ids:
                     break
 
-                # De-dup (handles flaky offset/paging)
+                # De-dup (handles flaky paging)
                 new_ids = [x for x in ids if x not in seen_ids]
                 for x in new_ids:
                     seen_ids.add(x)
 
-                # STOP if backend gave only duplicates
+                # If backend returned only duplicates, try advancing pageNumber/offset once more; if still dupes, stop.
                 if not new_ids:
-                    break
+                    # advance both and try one more time
+                    page_number += 1
+                    offset += PAGE_SIZE
+                    j2, status2, _ = robust_post(url, headers, {
+                        "params": {
+                            "query": {"filters": {"typesCriterion": [et]}},
+                            "fields": {"attributes": ["_ALL"]},
+                            "options": {"maxRecords": PAGE_SIZE, "pageNumber": page_number, "offset": offset}
+                        }
+                    }, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+                    ids2 = extract_entity_ids_from_page(j2, et) if status2 < 400 else []
+                    new_ids2 = [x for x in ids2 if x not in seen_ids]
+                    for x in new_ids2:
+                        seen_ids.add(x)
+                    if not new_ids2:
+                        break  # nothing new even after advancing -> end
+                    new_ids = new_ids2  # proceed with the new set
 
                 # Schedule reevaluations in parallel (10 workers)
                 futures = [pool.submit(reeval_worker, BASE_URL, headers, iid, et) for iid in new_ids]
@@ -335,7 +358,7 @@ if btn_reeval:
                     res = fut.result()
                     results.append(res)
 
-                    # Audit (write in main thread) — include per-entity duration_ms
+                    # Audit (main thread)
                     write_audit({
                         "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
                         "tenant": tenant or "",
@@ -348,7 +371,6 @@ if btn_reeval:
                         "latency_sec": f"{res['latencySec']:.2f}",
                         "message": res["message"],
                         "backend_request_id": res.get("backendRequestId") or "",
-                        "duration_ms": f"{res['duration_ms']:.1f}",
                     })
 
                     # Exact counters
@@ -365,34 +387,31 @@ if btn_reeval:
                         f"Reevaluating: {et} — {processed_this_type}/{display_total} (global {done}/{total_estimated or '?'})"
                     )
 
-                # Advance offset by HOW MANY THE API RETURNED (full page size returned by API)
+                # Advance paging for next pull
+                # Use what the API returned (len(ids)) for offset; increment page_number too.
                 offset += len(ids)
+                page_number += 1
 
-                # STOP when we reached known count
+                # STOP when we reached known total
                 if count_et is not None and len(seen_ids) >= count_et:
                     break
 
-                # STOP when last page had fewer than PAGE_SIZE
+                # STOP when last page had fewer than PAGE_SIZE (likely end)
                 if len(ids) < PAGE_SIZE:
                     break
 
-            # Per-type completion with exact count + average duration_ms
+            # Per-type completion with exact count + total time
             exact_total_for_type = len(seen_ids)
-            durations = [r["duration_ms"] for r in results if r["entityType"] == et]
-            avg_ms = round(sum(durations)/len(durations), 1) if durations else 0.0
-            st.success(f"[{et}] Completed reevaluation for {exact_total_for_type} entities (avg {avg_ms} ms/entity).")
+            per_type_elapsed = time.perf_counter() - per_type_t0
+            st.success(f"[{et}] Completed reevaluation for {exact_total_for_type} entities in {fmt_hms(per_type_elapsed)}.")
 
     st.success("Reevaluation run complete.")
 
 if results:
-    st.subheader("Run Results (includes per-entity time)")
-    # Sort results by entityType for readability
+    st.subheader("Run Results")
+    # Sorted by entityType then id for readability
     results_sorted = sorted(results, key=lambda x: (x["entityType"], x["id"]))
-    st.dataframe(
-        results_sorted,
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(results_sorted, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 st.subheader("Recent Audit Entries (today)")
