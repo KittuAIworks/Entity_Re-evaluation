@@ -27,10 +27,9 @@ MODEL_GET_PATH = "/api/entitymodelservice/get"
 APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
 
-# Performance
-PRIMARY_PAGE_SIZE   = 2000
-RECOVERY_PAGE_SIZES = [1000, 500]
-REEVAL_WORKERS      = 10
+# Simple, reliable paging
+CHUNK_SIZE   = 1000        # pull 1000 IDs per request
+REEVAL_WORKERS = 10        # concurrent re-evaluation calls
 
 # Audit
 AUDIT_DIR = "audit_logs"
@@ -40,7 +39,7 @@ os.makedirs(AUDIT_DIR, exist_ok=True)
 # HELPERS
 # ---------------------------------------------
 def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str) -> Dict[str, str]:
-    headers = {
+    return {
         "Content-Type": "application/json",
         "x-rdp-version": "8.1",
         "x-rdp-clientId": "rdpclient",
@@ -51,7 +50,6 @@ def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str)
         "Pragma": "no-cache",
         "x-tenant-id": tenant
     }
-    return headers
 
 def audit_path_today():
     return os.path.join(AUDIT_DIR, f"reevaluation_audit_{dt.datetime.now().strftime('%Y%m%d')}.csv")
@@ -150,69 +148,39 @@ def fmt_min_sec(seconds):
     total = int(seconds)
     return f"{total//60}m {total%60}s"
 
-
 # ---------------------------------------------
-# Paging strategies (clean, no heartbeat)
+# Simple offset-only pager (no caps)
 # ---------------------------------------------
-def _fetch_ids(base, headers, etype, opts):
-    j, status, _ = robust_post(f"{base}{APP_GET_PATH}", headers, {
-        "params":{
-            "query":{"filters":{"typesCriterion":[etype]}},
-            "fields":{"attributes":["_ALL"]},
-            "options": opts
+def fetch_ids_offset_only(base, headers, etype) -> Iterable[List[str]]:
+    """
+    Offset-only paging:
+      - options: {maxRecords: CHUNK_SIZE, offset: offset}
+      - offset += len(ids)
+      - stop when len(ids) == 0
+    """
+    offset = 0
+    while True:
+        body = {
+            "params":{
+                "query":{"filters":{"typesCriterion":[etype]}},
+                "fields":{"attributes":["_ALL"]},
+                "options":{"maxRecords": CHUNK_SIZE, "offset": offset}
+            }
         }
-    }, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-    if status >= 400: return [], status
-    return extract_ids(j, etype), status
-
-def pages_pageNumber(base, headers, etype, size):
-    page=1
-    while True:
-        ids, status = _fetch_ids(base, headers, etype, {"maxRecords":size,"pageNumber":page})
-        if status>=400 or not ids: break
+        j, status, _ = robust_post(f"{base}{APP_GET_PATH}", headers, body,
+                                   REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+        if status >= 400:
+            # stop on error; the caller will have partial results logged already
+            break
+        ids = extract_ids(j, etype)
+        if not ids:
+            break
         yield ids
-        if len(ids)<size: break
-        page+=1
-
-def pages_offset(base, headers, etype, size):
-    off=0
-    while True:
-        ids, status = _fetch_ids(base, headers, etype, {"maxRecords":size,"offset":off})
-        if status>=400 or not ids: break
-        yield ids
-        off += len(ids)
-        if len(ids)<size: break
-
-def fetch_ids_resilient(base, headers, etype, expected_total):
-    seen=set()
-
-    def only_new(seq):
-        for ids in seq:
-            new=[x for x in ids if x not in seen]
-            if new:
-                for n in new: seen.add(n)
-                yield new
-
-    # Phase A
-    for new in only_new(pages_pageNumber(base,headers,etype,PRIMARY_PAGE_SIZE)):
-        yield new
-        if expected_total and len(seen)>=expected_total: return
-    # Phase B
-    for new in only_new(pages_offset(base,headers,etype,PRIMARY_PAGE_SIZE)):
-        yield new
-        if expected_total and len(seen)>=expected_total: return
-    # Phase C sweeps
-    for sz in RECOVERY_PAGE_SIZES:
-        for new in only_new(pages_pageNumber(base,headers,etype,sz)):
-            yield new
-            if expected_total and len(seen)>=expected_total: return
-        for new in only_new(pages_offset(base,headers,etype,sz)):
-            yield new
-            if expected_total and len(seen)>=expected_total: return
-
+        offset += len(ids)
+        # continue until the API says no more
 
 # ---------------------------------------------
-# Worker
+# Worker (re-evaluation call)
 # ---------------------------------------------
 def reeval_worker(base, headers, iid, et):
     payload = make_request_payload(iid, et)
@@ -231,7 +199,6 @@ def reeval_worker(base, headers, iid, et):
         "backend_request_id": j.get("backendRequestId") or j.get("requestId"),
         "request_id":payload["requestId"]
     }
-
 
 # ---------------------------------------------
 # UI — SIDEBAR
@@ -283,7 +250,7 @@ if st.session_state.entity_types:
                  use_container_width=True, hide_index=True)
 
 # ---------------------------------------------
-# STEP 2: Load counts
+# STEP 2: Load counts (optional)
 # ---------------------------------------------
 st.subheader("② Get Counts per Entity Type")
 btn_counts = st.button("Load counts",disabled=not st.session_state.entity_types)
@@ -328,7 +295,7 @@ if sel_all:
 st.session_state.selected_types = selected
 
 # ---------------------------------------------
-# STEP 4: Re-evaluation
+# STEP 4: Re-evaluation (offset-only; live per-entity progress)
 # ---------------------------------------------
 st.subheader("④ Re-evaluation")
 btn_start = st.button("Start Re-evaluation", type="primary",
@@ -347,38 +314,39 @@ if btn_start:
     overall = st.progress(0.0)
     status_line = st.empty()
 
-    # Preflight pings
+    # Silent reachability probe (no "Preflight OK" text)
     for et in selected:
         tiny={"params":{"query":{"filters":{"typesCriterion":[et]}},
                         "options":{"maxRecords":1}}}
-        j,s,_ = robust_post(f"{BASE_URL}{APP_GET_PATH}", headers, tiny,
-                            timeout=10, max_retries=1, backoff=0.5)
+        _, s, _ = robust_post(f"{BASE_URL}{APP_GET_PATH}", headers, tiny,
+                              timeout=10, max_retries=1, backoff=0.5)
         if s>=400:
-            st.error(f"Preflight failed for {et} (HTTP {s})")
+            st.error(f"Cannot reach {et} (HTTP {s}). Check tenant/credentials and try again.")
             st.stop()
-        st.info(f"Preflight OK: {et}")
 
     per_type_exact={}
     done_global=0
-    denom = expected_global if (counts_available and expected_global>0) else None
+    denom = expected_global if (counts_available and expected_global and expected_global>0) else None
 
     with ThreadPoolExecutor(max_workers=REEVAL_WORKERS) as pool:
         for et in selected:
             t0=time.perf_counter()
-            expected_total = None
-            if counts_available:
-                expected_total = st.session_state.type_counts.get(et,{}).get("totalRecords")
+            expected_total = st.session_state.type_counts.get(et,{}).get("totalRecords") if counts_available else None
 
-            seen=set()
-            status_line.info(f"Re-evaluating: {et} — 0/{expected_total or '?'}")
+            processed_this_type = 0
+            unique_seen_ids=set()
 
-            # iterate ID-chunks
-            for new_ids in fetch_ids_resilient(BASE_URL,headers,et,expected_total):
-                futures=[pool.submit(reeval_worker,BASE_URL,headers,iid,et) for iid in new_ids]
+            status_line.info(f"Re-evaluating: {et} — 0/{expected_total or '?'} (global {done_global}/{expected_global or '?'})")
 
+            # OFFSET-ONLY ID streaming
+            for id_chunk in fetch_ids_offset_only(BASE_URL, headers, et):
+                futures=[pool.submit(reeval_worker,BASE_URL,headers,iid,et) for iid in id_chunk]
+
+                # Update UI after each entity completes
                 for fut in as_completed(futures):
                     res=fut.result()
                     results.append(res)
+
                     write_audit({
                         "timestamp_iso":dt.datetime.now().isoformat(timespec="seconds"),
                         "tenant":tenant,
@@ -393,36 +361,37 @@ if btn_start:
                         "backend_request_id":res["backend_request_id"],
                     })
 
-                for iid in new_ids:
-                    if iid not in seen:
-                        seen.add(iid)
-                        done_global+=1
+                    if res["id"] not in unique_seen_ids:
+                        unique_seen_ids.add(res["id"])
+                        processed_this_type += 1
+                        done_global += 1
 
-                total_display = expected_total if expected_total else "?"
-                if denom:
-                    overall.progress(min(1.0, done_global/max(1,denom)))
-                else:
-                    overall.progress(0.0 if done_global==0 else min(1.0, done_global/(done_global+1)))
+                        if denom:
+                            overall.progress(min(1.0, done_global/max(1,denom)))
+                        else:
+                            overall.progress(0.0 if done_global==0 else min(1.0, done_global/(done_global+1)))
 
-                status_line.info(
-                    f"Re-evaluating: {et} — {len(seen)}/{total_display} "
-                    f"(global {done_global}/{expected_global or '?'})"
-                )
+                        status_line.info(
+                            f"Re-evaluating: {et} — {processed_this_type}/{expected_total or '?'} "
+                            f"(global {done_global}/{expected_global or '?'})"
+                        )
 
-                if expected_total and len(seen)>=expected_total:
+                # If we know the exact expected count, allow an early stop when reached
+                if expected_total and processed_this_type >= expected_total:
                     break
 
-            per_type_exact[et]=len(seen)
+            per_type_exact[et]=processed_this_type
             t_elapsed=fmt_min_sec(time.perf_counter()-t0)
             st.success(f"[{et}] Completed re-evaluation for {per_type_exact[et]} entities in {t_elapsed}.")
 
+    # Final validation
     if counts_available:
         missing=[]
         for et in selected:
             exp = int(st.session_state.type_counts.get(et,{}).get("totalRecords") or 0)
             got = per_type_exact.get(et,0)
             if got < exp:
-                missing.append((et,exp-got,exp,got))
+                missing.append((et, exp-got, exp, got))
         total_exp = sum(int(st.session_state.type_counts.get(et,{}).get("totalRecords") or 0) for et in selected)
         total_got = sum(per_type_exact.get(et,0) for et in selected)
         if missing:
@@ -447,4 +416,4 @@ if recent:
     st.dataframe(recent,use_container_width=True,hide_index=True)
 else:
     st.info("No activity yet today.")
-
+``
