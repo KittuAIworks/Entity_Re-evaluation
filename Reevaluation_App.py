@@ -6,6 +6,7 @@ import re
 import math
 import datetime as dt
 from typing import Dict, Any, Tuple, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import streamlit as st
@@ -16,7 +17,7 @@ import streamlit as st
 st.set_page_config(page_title="Entity Reevaluation (Bulk)", page_icon="🔄", layout="wide")
 st.title("🔄 Entity Reevaluation — Single / Multiple / All Types")
 
-# Minimal runtime (Streamlit + Requests only)
+# Runtime knobs
 MOCK_MODE = False
 REQUEST_TIMEOUT = 40
 MAX_RETRIES = 3
@@ -27,8 +28,9 @@ MODEL_GET_PATH = "/api/entitymodelservice/get"
 APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
 
-# Fixed page size for streaming pulls (no UI control)
-PAGE_SIZE = 500
+# Performance
+PAGE_SIZE = 2000          # <= as requested: try to bring all records in one shot
+REEVAL_WORKERS = 10       # <= as requested: 10 parallel reevaluate calls
 
 # Audit
 AUDIT_DIR = "audit_logs"
@@ -38,9 +40,6 @@ os.makedirs(AUDIT_DIR, exist_ok=True)
 # HELPERS
 # ---------------------------------------------
 def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str = "") -> Dict[str, str]:
-    """
-    Matches your previous header style; optional x-tenant-id included if you need it.
-    """
     headers = {
         "Content-Type": "application/json",
         "x-rdp-version": "8.1",
@@ -115,16 +114,12 @@ def robust_post(url: str, headers: Dict[str, str], body: Dict[str, Any],
 
 # ---- extractors tuned to your API ----
 def find_total_records(j: Any) -> Optional[int]:
-    """Fast path for counts: response.totalRecords"""
     try:
         return int(j.get("response", {}).get("totalRecords"))
     except Exception:
         return None
 
 def extract_entity_type_names(j: Any) -> List[str]:
-    """
-    Extracts type names from response.entityModels where item.type == 'entityType' and 'name' exists.
-    """
     names: List[str] = []
     seen = set()
     try:
@@ -139,9 +134,6 @@ def extract_entity_type_names(j: Any) -> List[str]:
     return names
 
 def extract_entity_ids_from_page(j: Any, expected_type: str) -> List[str]:
-    """
-    Extract ids from `response.entities` where `type == expected_type` (single page).
-    """
     ids: List[str] = []
     try:
         entities = j.get("response", {}).get("entities", [])
@@ -154,6 +146,21 @@ def extract_entity_ids_from_page(j: Any, expected_type: str) -> List[str]:
         pass
     return ids
 
+# Worker for threaded reevaluation
+def reeval_worker(base_url: str, headers: Dict[str, str], iid: str, et: str) -> Dict[str, Any]:
+    payload = make_request_payload(iid, et)
+    url = f"{base_url}{REEVAL_PATH}"
+    j, status, latency = robust_post(url, headers, {"entity": payload["entity"]},
+                                     REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+    success = (200 <= status < 300) and bool(j.get("success", True))
+    msg = j.get("message") or j.get("error","")
+    backend_rid = j.get("requestId") or j.get("backendRequestId") or ""
+    return {
+        "entityType": et, "id": iid, "httpStatus": status, "success": success,
+        "latencySec": round(latency, 2), "message": msg[:200],
+        "backendRequestId": backend_rid, "requestId": payload["requestId"]
+    }
+
 # ---------------------------------------------
 # SIDEBAR — Connection (tenant only)
 # ---------------------------------------------
@@ -164,7 +171,6 @@ with st.sidebar:
     client_id = st.text_input("Client ID", value="")
     client_secret = st.text_input("Client Secret", value="", type="password")
 
-# Build base URL (tenant subdomain only)
 BASE_URL = f"https://{tenant}.syndigo.com" if tenant else ""
 
 # ---------------------------------------------
@@ -204,7 +210,7 @@ if st.session_state.entity_types:
     st.dataframe([{"entityType": n} for n in st.session_state.entity_types], use_container_width=True, hide_index=True)
 
 # ---------------------------------------------
-# STEP 2 — Load counts per entity type (optional, used for progress)
+# STEP 2 — Get counts (optional but improves progress accuracy)
 # ---------------------------------------------
 st.subheader("② Get Counts per Entity Type")
 btn_counts = st.button("Load counts", disabled=not st.session_state.entity_types)
@@ -231,7 +237,7 @@ if st.session_state.type_counts:
     st.dataframe(table, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------
-# STEP 3 — Select types (no ID prefetch)
+# STEP 3 — Select types
 # ---------------------------------------------
 st.subheader("③ Select Types")
 left, right = st.columns([3, 1])
@@ -246,7 +252,7 @@ if sel_all:
 st.session_state.selected_types = selected
 
 # ---------------------------------------------
-# STEP 4 — Bulk Reevaluation (stream IDs on-the-fly)
+# STEP 4 — Bulk Reevaluation (stream pages + 10 threads)
 # ---------------------------------------------
 st.subheader("④ Reevaluation")
 btn_reeval = st.button("Start Reevaluation", type="primary",
@@ -256,107 +262,110 @@ results: List[Dict[str, Any]] = []
 if btn_reeval:
     headers = build_headers(user_id, client_id, client_secret, tenant)
 
-    # Determine total jobs for progress (best effort, based on counts if available)
-    def get_count(et: str) -> Optional[int]:
-        try:
-            v = st.session_state.type_counts.get(et, {}).get("totalRecords")
-            return int(v) if v is not None else None
-        except Exception:
-            return None
-
+    # Get total estimated jobs (if counts loaded)
     total_estimated = 0
     counts_available = True
     for et in selected:
-        c = get_count(et)
-        if c is None:
+        tr = (st.session_state.type_counts.get(et) or {}).get("totalRecords") if st.session_state.type_counts else None
+        try:
+            total_estimated += int(tr) if tr is not None else 0
+            if tr is None: counts_available = False
+        except Exception:
             counts_available = False
-            break
-        total_estimated += c
 
-    # Progress trackers
     done = 0
     overall = st.progress(0.0)
     status_area = st.empty()
-    per_type_box = st.empty()
 
-    for et in selected:
-        # If we know the count, we can show per-type page plan
-        count_et = get_count(et)
-        per_type_pages = math.ceil(count_et / PAGE_SIZE) if (count_et and count_et > 0) else None
-        fetched_ids_this_type = 0
+    # Single executor reused across all types
+    with ThreadPoolExecutor(max_workers=REEVAL_WORKERS) as pool:
+        for et in selected:
+            seen_ids: set = set()
+            offset = 0
+            page_idx = 0
+            processed_this_type = 0
+            count_et = None
+            if st.session_state.type_counts:
+                try:
+                    count_et = int((st.session_state.type_counts.get(et) or {}).get("totalRecords") or 0)
+                except Exception:
+                    count_et = None
 
-        offset = 0
-        page_idx = 0
-        while True:
-            page_idx += 1
-            body = {
-                "params": {
-                    "query": {"filters": {"typesCriterion": [et]}},
-                    "fields": {"attributes": ["_ALL"]},
-                    "options": {"maxRecords": PAGE_SIZE, "offset": offset}
+            while True:
+                page_idx += 1
+                # Pull one (large) page
+                body = {
+                    "params": {
+                        "query": {"filters": {"typesCriterion": [et]}},
+                        "fields": {"attributes": ["_ALL"]},
+                        "options": {"maxRecords": PAGE_SIZE, "offset": offset}
+                    }
                 }
-            }
-            url = f"{BASE_URL}{APP_GET_PATH}"
-            j, status, _ = robust_post(url, headers, body, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-            if status >= 400:
-                status_area.error(f"[{et}] Failed to fetch page offset={offset} (HTTP {status}). {j.get('error','')[:160]}")
-                break
+                url = f"{BASE_URL}{APP_GET_PATH}"
+                j, status, _ = robust_post(url, headers, body, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+                if status >= 400:
+                    status_area.error(f"[{et}] Failed to fetch page offset={offset} (HTTP {status}). {j.get('error','')[:160]}")
+                    break
 
-            # Stream IDs from this page
-            ids = extract_entity_ids_from_page(j, et)
-            if not ids:
-                # no more data
-                break
+                ids = extract_entity_ids_from_page(j, et)
 
-            # Immediately reevaluate for each ID (no storing)
-            for iid in ids:
-                payload = make_request_payload(iid, et)
-                reeval_url = f"{BASE_URL}{REEVAL_PATH}"
-                rj, rstatus, rlat = robust_post(reeval_url, headers, {"entity": payload["entity"]},
-                                                REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-                success = (200 <= rstatus < 300) and bool(rj.get("success", True))
-                msg = rj.get("message") or rj.get("error","")
-                backend_rid = rj.get("requestId") or rj.get("backendRequestId") or ""
+                # STOP if API gave no more data
+                if not ids:
+                    break
 
-                results.append({
-                    "entityType": et, "id": iid, "httpStatus": rstatus,
-                    "success": success, "latencySec": round(rlat, 2), "message": msg[:200],
-                    "backendRequestId": backend_rid
-                })
+                # De-dup (handles flaky offset/paging)
+                new_ids = [x for x in ids if x not in seen_ids]
+                for x in new_ids:
+                    seen_ids.add(x)
 
-                write_audit({
-                    "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
-                    "tenant": tenant or "",
-                    "user_id": user_id or "system",
-                    "entity_id": iid,
-                    "entity_type": et,
-                    "request_id": payload["requestId"],
-                    "status": "success" if success else "failure",
-                    "http_status": rstatus,
-                    "latency_sec": f"{rlat:.2f}",
-                    "message": msg,
-                    "backend_request_id": backend_rid,
-                })
+                # STOP if backend gave only duplicates
+                if not new_ids:
+                    break
 
-                # Update progress
-                done += 1
-                fetched_ids_this_type += 1
-                if counts_available and total_estimated > 0:
-                    overall.progress(min(1.0, done / total_estimated))
-                status_area.info(f"Reevaluating: {et} — {fetched_ids_this_type}/{count_et or '?'} (global {done}/{total_estimated or '?'})")
+                # Schedule reevaluations in parallel
+                futures = [pool.submit(reeval_worker, BASE_URL, headers, iid, et) for iid in new_ids]
 
-            # Advance offset by the number of ids processed
-            offset += len(ids)
+                # Consume results as they complete
+                for fut in as_completed(futures):
+                    res = fut.result()
+                    results.append(res)
 
-            # Stop if we reached the known count
-            if count_et is not None and offset >= count_et:
-                break
+                    # Audit (write in main thread)
+                    write_audit({
+                        "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
+                        "tenant": tenant or "",
+                        "user_id": user_id or "system",
+                        "entity_id": res["id"],
+                        "entity_type": et,
+                        "request_id": res.get("requestId") or "",
+                        "status": "success" if res["success"] else "failure",
+                        "http_status": res["httpStatus"],
+                        "latency_sec": f"{res['latencySec']:.2f}",
+                        "message": res["message"],
+                        "backend_request_id": res.get("backendRequestId") or "",
+                    })
 
-            # If the API returned fewer than PAGE_SIZE, we've hit the end
-            if len(ids) < PAGE_SIZE:
-                break
+                    processed_this_type += 1
+                    done += 1
+                    denom = total_estimated if (counts_available and total_estimated > 0) else max(1, done)
+                    overall.progress(min(1.0, done / denom))
+                    # Show per-type progress with a hard cap at count_et if known
+                    display_done = min(processed_this_type, count_et) if count_et else processed_this_type
+                    display_total = count_et if count_et else "?"
+                    status_area.info(f"Reevaluating: {et} — {display_done}/{display_total} (global {done}/{total_estimated or '?'})")
 
-        per_type_box.success(f"[{et}] Completed reevaluation for ~{fetched_ids_this_type} entities.")
+                # Advance offset by HOW MANY THE API RETURNED (not by new_ids only)
+                offset += len(ids)
+
+                # STOP when we reached known count
+                if count_et is not None and len(seen_ids) >= count_et:
+                    break
+
+                # STOP when last page had fewer than PAGE_SIZE
+                if len(ids) < PAGE_SIZE:
+                    break
+
+            st.success(f"[{et}] Completed reevaluation for ~{processed_this_type} entities.")
 
     st.success("Reevaluation run complete.")
 
