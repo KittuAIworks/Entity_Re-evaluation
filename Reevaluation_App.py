@@ -27,9 +27,9 @@ MODEL_GET_PATH = "/api/entitymodelservice/get"
 APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
 
-# Simple, reliable paging
-CHUNK_SIZE   = 1000        # pull 1000 IDs per request
-REEVAL_WORKERS = 10        # concurrent re-evaluation calls
+# Pager defaults (kept simple but resilient)
+PAGE_SIZES        = [500, 250, 100]  # try in this order
+REEVAL_WORKERS    = 10                # concurrent re-evaluation calls
 
 # Audit
 AUDIT_DIR = "audit_logs"
@@ -149,35 +149,88 @@ def fmt_min_sec(seconds):
     return f"{total//60}m {total%60}s"
 
 # ---------------------------------------------
-# Simple offset-only pager (no caps)
+# Resilient but simple pager:
+#  1) Try offset with size=500 (then 250, 100)
+#  2) If stall (duplicates/no new), switch to pageNumber with same sizes
+#  3) Stop only when no new IDs or expected_total reached
 # ---------------------------------------------
-def fetch_ids_offset_only(base, headers, etype) -> Iterable[List[str]]:
-    """
-    Offset-only paging:
-      - options: {maxRecords: CHUNK_SIZE, offset: offset}
-      - offset += len(ids)
-      - stop when len(ids) == 0
-    """
-    offset = 0
-    while True:
-        body = {
+def _fetch_with_options(base, headers, etype, options):
+    j, status, _ = robust_post(
+        f"{base}{APP_GET_PATH}",
+        headers,
+        {
             "params":{
                 "query":{"filters":{"typesCriterion":[etype]}},
                 "fields":{"attributes":["_ALL"]},
-                "options":{"maxRecords": CHUNK_SIZE, "offset": offset}
+                "options": options
             }
-        }
-        j, status, _ = robust_post(f"{base}{APP_GET_PATH}", headers, body,
-                                   REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-        if status >= 400:
-            # stop on error; the caller will have partial results logged already
-            break
-        ids = extract_ids(j, etype)
-        if not ids:
-            break
-        yield ids
-        offset += len(ids)
-        # continue until the API says no more
+        },
+        REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS
+    )
+    if status >= 400:
+        return [], status
+    return extract_ids(j, etype), status
+
+def fetch_ids_resilient(base, headers, etype, expected_total=None) -> Iterable[List[str]]:
+    seen = set()
+
+    def only_new(ids):
+        return [i for i in ids if i not in seen]
+
+    # Strategy list: [(mode, size)]
+    strategies = []
+    for sz in PAGE_SIZES:
+        strategies.append(("offset", sz))
+    for sz in PAGE_SIZES:
+        strategies.append(("page", sz))
+
+    for mode, size in strategies:
+        stall_count = 0
+        # reset cursor per strategy
+        offset = 0
+        page   = 1
+
+        while True:
+            options = {"maxRecords": size}
+            if mode == "offset":
+                options["offset"] = offset
+            else:
+                options["pageNumber"] = page
+
+            ids, status = _fetch_with_options(base, headers, etype, options)
+            if status >= 400:
+                break  # stop this strategy; try next
+
+            if not ids:
+                break  # no more data for this strategy
+
+            new_ids = only_new(ids)
+            if not new_ids:
+                stall_count += 1
+                # too many stalls → switch strategy/size
+                if stall_count >= 2:
+                    break
+            else:
+                stall_count = 0
+                for i in new_ids:
+                    seen.add(i)
+                yield new_ids
+
+                if expected_total and len(seen) >= expected_total:
+                    return
+
+            # advance cursor
+            if mode == "offset":
+                offset += len(ids)  # advance by what API returned
+            else:
+                page += 1
+
+        # If we already collected something in this strategy and hit a stall/empty, move on
+        if expected_total and len(seen) >= expected_total:
+            return
+
+    # end: return whatever collected
+    return
 
 # ---------------------------------------------
 # Worker (re-evaluation call)
@@ -295,7 +348,7 @@ if sel_all:
 st.session_state.selected_types = selected
 
 # ---------------------------------------------
-# STEP 4: Re-evaluation (offset-only; live per-entity progress)
+# STEP 4: Re-evaluation (resilient pager; live per-entity progress)
 # ---------------------------------------------
 st.subheader("④ Re-evaluation")
 btn_start = st.button("Start Re-evaluation", type="primary",
@@ -338,8 +391,8 @@ if btn_start:
 
             status_line.info(f"Re-evaluating: {et} — 0/{expected_total or '?'} (global {done_global}/{expected_global or '?'})")
 
-            # OFFSET-ONLY ID streaming
-            for id_chunk in fetch_ids_offset_only(BASE_URL, headers, et):
+            # Resilient streaming (offset first; auto-switch to page mode if needed)
+            for id_chunk in fetch_ids_resilient(BASE_URL, headers, et, expected_total):
                 futures=[pool.submit(reeval_worker,BASE_URL,headers,iid,et) for iid in id_chunk]
 
                 # Update UI after each entity completes
@@ -416,4 +469,3 @@ if recent:
     st.dataframe(recent,use_container_width=True,hide_index=True)
 else:
     st.info("No activity yet today.")
-
