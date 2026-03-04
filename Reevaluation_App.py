@@ -381,9 +381,9 @@ if btn_reeval:
 
     # show immediate start note
     status_area.info("Starting re-evaluation… preparing preflight checks. This ensures you see progress right away even if the first API call is slow.")
-    st.write("")  # a small spacer
+    st.write("")  # spacer
 
-    # --- PREFLIGHT (fast ping) so the UI updates immediately ---
+    # --- PREFLIGHT (fast ping) ---
     preflight_fail = False
     for et in selected:
         tiny_body = {
@@ -402,14 +402,13 @@ if btn_reeval:
     if preflight_fail:
         st.stop()
 
-    # heartbeat helper
-    last_hb = time.time()
+    # ✅ Fixed heartbeat: use a mutable box (list) instead of nonlocal
+    last_hb = [time.time()]
     def heartbeat(msg: str):
-        nonlocal last_hb
         now = time.time()
-        if now - last_hb >= 2.0:  # update at most once every ~2s
+        if now - last_hb[0] >= 2.0:  # update at most once every ~2s
             hb_area.info(f"⏳ {msg}")
-            last_hb = now
+            last_hb[0] = now
 
     # Track per-type exacts for final validation
     per_type_exact: Dict[str, int] = {}
@@ -465,7 +464,6 @@ if btn_reeval:
                 if denom:
                     overall.progress(min(1.0, done_global / max(1, denom)))
                 else:
-                    # if counts not loaded, keep progress bounded by what we've processed
                     overall.progress(0.0 if done_global == 0 else min(1.0, done_global / (done_global + 1)))
                 status_area.info(f"Re-evaluating: {et} — {len(seen_for_type)}/{total_display} (global {done_global}/{expected_global or '?'})")
 
@@ -515,3 +513,4 @@ if recent:
     st.dataframe(recent, use_container_width=True, hide_index=True)
 else:
     st.info("No activity yet today.")
+``
