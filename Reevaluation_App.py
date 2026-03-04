@@ -5,7 +5,7 @@ import uuid
 import re
 import math
 import datetime as dt
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -29,8 +29,9 @@ APP_GET_PATH   = "/api/entityappservice/get"
 REEVAL_PATH    = "/api/entitygovernservice/reevaluate"
 
 # Performance
-PAGE_SIZE = 2000          # fetch large pages (works for <=2000 in one call; multi-page for >2000)
-REEVAL_WORKERS = 10       # concurrent reevaluation calls
+PRIMARY_PAGE_SIZE   = 2000
+RECOVERY_PAGE_SIZES = [1000, 500]     # sweeps if we still miss records
+REEVAL_WORKERS     = 10               # concurrent reevaluation calls
 
 # Audit
 AUDIT_DIR = "audit_logs"
@@ -146,15 +147,107 @@ def extract_entity_ids_from_page(j: Any, expected_type: str) -> List[str]:
         pass
     return ids
 
-def fmt_hms(seconds: float) -> str:
-    """Format seconds -> 'HH:MM:SS.mmm'"""
-    ms = int((seconds - int(seconds)) * 1000)
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+def fmt_minutes(seconds: float) -> str:
+    """Format seconds -> 'X.Y min'."""
+    return f"{(seconds/60.0):.1f} min"
 
-# Worker for threaded reevaluation
+# ---------------------------------------------
+# Paging strategies
+# ---------------------------------------------
+def _post_entities(base_url: str, headers: Dict[str, str], entity_type: str, options: Dict[str, Any]) -> Tuple[List[str], int]:
+    """Helper to call entityappservice/get with the given options and return (ids, http_status)."""
+    body = {
+        "params": {
+            "query": {"filters": {"typesCriterion": [entity_type]}},
+            "fields": {"attributes": ["_ALL"]},
+            "options": options
+        }
+    }
+    url = f"{base_url}{APP_GET_PATH}"
+    j, status, _ = robust_post(url, headers, body, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
+    if status >= 400:
+        return [], status
+    return extract_entity_ids_from_page(j, entity_type), status
+
+def iter_pages_pageNumber(base_url: str, headers: Dict[str, str], entity_type: str, page_size: int) -> Iterable[List[str]]:
+    """Yield pages of IDs using pageNumber-based paging."""
+    page = 1
+    while True:
+        ids, status = _post_entities(base_url, headers, entity_type, {"maxRecords": page_size, "pageNumber": page})
+        if status >= 400 or not ids:
+            break
+        yield ids
+        if len(ids) < page_size:
+            break
+        page += 1
+
+def iter_pages_offset(base_url: str, headers: Dict[str, str], entity_type: str, page_size: int) -> Iterable[List[str]]:
+    """Yield pages of IDs using offset-based paging."""
+    offset = 0
+    while True:
+        ids, status = _post_entities(base_url, headers, entity_type, {"maxRecords": page_size, "offset": offset})
+        if status >= 400 or not ids:
+            break
+        yield ids
+        offset += len(ids)
+        if len(ids) < page_size:
+            break
+
+def fetch_all_ids_resilient(base_url: str, headers: Dict[str, str], entity_type: str, expected_total: Optional[int]) -> Iterable[List[str]]:
+    """
+    Robust generator that yields chunks of *new* IDs for the entity_type.
+    Strategy:
+      Phase A: pageNumber with big pages.
+      Phase B: offset with big pages.
+      Phase C: recovery sweeps (pageNumber and offset) with smaller pages (1000, then 500).
+    """
+    seen_ids: set = set()
+
+    # helper to yield only new IDs from any iterator
+    def yield_new_from(iterator: Iterable[List[str]]) -> int:
+        new_gained = 0
+        for ids in iterator:
+            new_ids = [x for x in ids if x not in seen_ids]
+            if new_ids:
+                for x in new_ids: seen_ids.add(x)
+                yield new_ids
+                new_gained += len(new_ids)
+        return new_gained
+
+    # Phase A: pageNumber @2000
+    gained = 0
+    for new_ids in yield_new_from(iter_pages_pageNumber(base_url, headers, entity_type, PRIMARY_PAGE_SIZE)):
+        gained += len(new_ids)
+        yield new_ids
+    if expected_total is not None and len(seen_ids) >= expected_total:
+        return
+
+    # Phase B: offset @2000
+    for new_ids in yield_new_from(iter_pages_offset(base_url, headers, entity_type, PRIMARY_PAGE_SIZE)):
+        gained += len(new_ids)
+        yield new_ids
+    if expected_total is not None and len(seen_ids) >= expected_total:
+        return
+
+    # Phase C: recovery sweeps with smaller page sizes
+    for ps in RECOVERY_PAGE_SIZES:
+        # Sweep via pageNumber
+        for new_ids in yield_new_from(iter_pages_pageNumber(base_url, headers, entity_type, ps)):
+            yield new_ids
+            if expected_total is not None and len(seen_ids) >= expected_total:
+                return
+        # Sweep via offset
+        for new_ids in yield_new_from(iter_pages_offset(base_url, headers, entity_type, ps)):
+            yield new_ids
+            if expected_total is not None and len(seen_ids) >= expected_total:
+                return
+
+    # If we still didn't reach expected_total (backend under-reports or filters differ), just return what we got.
+    return
+
+# ---------------------------------------------
+# Reevaluation worker
+# ---------------------------------------------
 def reeval_worker(base_url: str, headers: Dict[str, str], iid: str, et: str) -> Dict[str, Any]:
     payload = make_request_payload(iid, et)
     url = f"{base_url}{REEVAL_PATH}"
@@ -190,6 +283,12 @@ btn_fetch_types = st.button("Fetch entity types", type="primary", disabled=not B
 if "entity_types" not in st.session_state: st.session_state.entity_types = []
 if "type_counts" not in st.session_state: st.session_state.type_counts = {}
 if "selected_types" not in st.session_state: st.session_state.selected_types = []
+
+def find_total_records(j: Any) -> Optional[int]:  # (redefined here to keep file self-contained)
+    try:
+        return int(j.get("response", {}).get("totalRecords"))
+    except Exception:
+        return None
 
 if btn_fetch_types:
     headers = build_headers(user_id, client_id, client_secret, tenant)
@@ -260,7 +359,7 @@ if sel_all:
 st.session_state.selected_types = selected
 
 # ---------------------------------------------
-# STEP 4 — Bulk Reevaluation (stream pages + 10 threads + accurate counts + per-type total time)
+# STEP 4 — Bulk Reevaluation (adaptive pager + 10 threads + exact counts + per-type minutes)
 # ---------------------------------------------
 st.subheader("④ Reevaluation")
 btn_reeval = st.button("Start Reevaluation", type="primary",
@@ -270,95 +369,43 @@ results: List[Dict[str, Any]] = []
 if btn_reeval:
     headers = build_headers(user_id, client_id, client_secret, tenant)
 
-    # Total estimated jobs (if counts loaded)
-    total_estimated = 0
-    counts_available = True
-    for et in selected:
-        tr = (st.session_state.type_counts.get(et) or {}).get("totalRecords") if st.session_state.type_counts else None
-        try:
-            total_estimated += int(tr) if tr is not None else 0
-            if tr is None: counts_available = False
-        except Exception:
-            counts_available = False
+    # Expected global (if counts loaded)
+    counts_available = bool(st.session_state.type_counts)
+    expected_global = sum(int((st.session_state.type_counts.get(et) or {}).get("totalRecords") or 0) for et in selected) if counts_available else None
 
-    done = 0
+    # progress
+    done_global = 0
     overall = st.progress(0.0)
     status_area = st.empty()
 
+    # Track per-type exacts for final validation
+    per_type_exact: Dict[str, int] = {}
+
     with ThreadPoolExecutor(max_workers=REEVAL_WORKERS) as pool:
         for et in selected:
-            per_type_t0 = time.perf_counter()  # <-- start timer for this entity type
-
-            seen_ids: set = set()
-            offset = 0
-            page_number = 1
-            processed_this_type = 0
-            count_et = None
-            if st.session_state.type_counts:
+            per_type_t0 = time.perf_counter()
+            expected_total = None
+            if counts_available:
                 try:
-                    count_et = int((st.session_state.type_counts.get(et) or {}).get("totalRecords") or 0)
+                    expected_total = int((st.session_state.type_counts.get(et) or {}).get("totalRecords") or 0)
                 except Exception:
-                    count_et = None
+                    expected_total = None
 
-            while True:
-                # Pull a large page (2000) using BOTH pageNumber and offset to handle backends that ignore one of them
-                body = {
-                    "params": {
-                        "query": {"filters": {"typesCriterion": [et]}},
-                        "fields": {"attributes": ["_ALL"]},
-                        "options": {
-                            "maxRecords": PAGE_SIZE,
-                            "pageNumber": page_number,   # try pageNumber-based paging
-                            "offset": offset             # keep offset for back-compat backends
-                        }
-                    }
-                }
-                url = f"{BASE_URL}{APP_GET_PATH}"
-                j, status, _ = robust_post(url, headers, body, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-                if status >= 400:
-                    status_area.error(f"[{et}] Failed to fetch page #{page_number} (offset={offset}) — HTTP {status}. {j.get('error','')[:160]}")
-                    break
-
-                ids = extract_entity_ids_from_page(j, et)
-
-                # STOP if API gave no more data
-                if not ids:
-                    break
-
-                # De-dup (handles flaky paging)
-                new_ids = [x for x in ids if x not in seen_ids]
-                for x in new_ids:
-                    seen_ids.add(x)
-
-                # If backend returned only duplicates, try advancing pageNumber/offset once more; if still dupes, stop.
+            # Stream IDs with resilient pager and reevaluate in parallel
+            seen_for_type: set = set()
+            for new_ids in fetch_all_ids_resilient(BASE_URL, headers, et, expected_total):
                 if not new_ids:
-                    # advance both and try one more time
-                    page_number += 1
-                    offset += PAGE_SIZE
-                    j2, status2, _ = robust_post(url, headers, {
-                        "params": {
-                            "query": {"filters": {"typesCriterion": [et]}},
-                            "fields": {"attributes": ["_ALL"]},
-                            "options": {"maxRecords": PAGE_SIZE, "pageNumber": page_number, "offset": offset}
-                        }
-                    }, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_SECONDS)
-                    ids2 = extract_entity_ids_from_page(j2, et) if status2 < 400 else []
-                    new_ids2 = [x for x in ids2 if x not in seen_ids]
-                    for x in new_ids2:
-                        seen_ids.add(x)
-                    if not new_ids2:
-                        break  # nothing new even after advancing -> end
-                    new_ids = new_ids2  # proceed with the new set
+                    continue
 
-                # Schedule reevaluations in parallel (10 workers)
+                # schedule reevals
                 futures = [pool.submit(reeval_worker, BASE_URL, headers, iid, et) for iid in new_ids]
 
-                # Consume results as they complete
+                # consume
                 for fut in as_completed(futures):
                     res = fut.result()
                     results.append(res)
 
-                    # Audit (main thread)
+                    # audit
                     write_audit({
                         "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
                         "tenant": tenant or "",
@@ -373,43 +420,51 @@ if btn_reeval:
                         "backend_request_id": res.get("backendRequestId") or "",
                     })
 
-                    # Exact counters
-                    processed_this_type = len(seen_ids)     # unique processed for this type
-                    done += 1
+                # mark these as processed (unique)
+                for iid in new_ids:
+                    if iid not in seen_for_type:
+                        seen_for_type.add(iid)
+                        done_global += 1
 
-                    # Global progress
-                    denom = total_estimated if (counts_available and total_estimated > 0) else max(1, done)
-                    overall.progress(min(1.0, done / denom))
+                # update UI
+                total_display = expected_total if (isinstance(expected_total, int) and expected_total > 0) else "?"
+                denom = expected_global if (counts_available and expected_global and expected_global > 0) else max(1, done_global)
+                overall.progress(min(1.0, done_global / denom))
+                status_area.info(f"Reevaluating: {et} — {len(seen_for_type)}/{total_display} (global {done_global}/{expected_global or '?'})")
 
-                    # Precise per-type progress text
-                    display_total = count_et if (isinstance(count_et, int) and count_et > 0) else "?"
-                    status_area.info(
-                        f"Reevaluating: {et} — {processed_this_type}/{display_total} (global {done}/{total_estimated or '?'})"
-                    )
-
-                # Advance paging for next pull
-                # Use what the API returned (len(ids)) for offset; increment page_number too.
-                offset += len(ids)
-                page_number += 1
-
-                # STOP when we reached known total
-                if count_et is not None and len(seen_ids) >= count_et:
+                # short-circuit if we reached expected total
+                if expected_total is not None and len(seen_for_type) >= expected_total:
                     break
 
-                # STOP when last page had fewer than PAGE_SIZE (likely end)
-                if len(ids) < PAGE_SIZE:
-                    break
+            # finalize per-type
+            per_type_exact[et] = len(seen_for_type)
+            elapsed_min = fmt_minutes(time.perf_counter() - per_type_t0)
+            st.success(f"[{et}] Completed reevaluation for {per_type_exact[et]} entities in {elapsed_min}.")
 
-            # Per-type completion with exact count + total time
-            exact_total_for_type = len(seen_ids)
-            per_type_elapsed = time.perf_counter() - per_type_t0
-            st.success(f"[{et}] Completed reevaluation for {exact_total_for_type} entities in {fmt_hms(per_type_elapsed)}.")
+    # ---------- Final validation & messaging ----------
+    if counts_available:
+        missing_types = []
+        for et in selected:
+            exp = int((st.session_state.type_counts.get(et) or {}).get("totalRecords") or 0)
+            got = int(per_type_exact.get(et, 0))
+            if got < exp:
+                missing_types.append((et, exp - got, exp, got))
 
-    st.success("Reevaluation run complete.")
+        if missing_types:
+            st.warning("⚠️ Reevaluation finished with deficits: the following entity types did not reach their expected counts:")
+            for et, deficit, exp, got in missing_types:
+                st.write(f"- **{et}**: processed **{got}** / expected **{exp}** (missing **{deficit}**)")
+
+            total_expected = sum(int((st.session_state.type_counts.get(et) or {}).get("totalRecords") or 0) for et in selected)
+            total_got = sum(int(per_type_exact.get(et, 0)) for et in selected)
+            st.warning(f"Global processed: **{total_got}/{total_expected}**")
+        else:
+            st.success("✅ Reevaluation run complete (all counts matched).")
+    else:
+        st.success("Reevaluation run complete.")
 
 if results:
     st.subheader("Run Results")
-    # Sorted by entityType then id for readability
     results_sorted = sorted(results, key=lambda x: (x["entityType"], x["id"]))
     st.dataframe(results_sorted, use_container_width=True, hide_index=True)
 
