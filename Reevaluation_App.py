@@ -8,19 +8,15 @@ from typing import Dict, Any, Tuple
 
 import requests
 import streamlit as st
-from pydantic import BaseModel, Field
 
 # ---------------------------------------------
-# APP CONFIG (same pattern as your previous apps)
+# APP CONFIG
 # ---------------------------------------------
 st.set_page_config(page_title="Entity Reevaluation", page_icon="🔄", layout="centered")
 st.title("🔄 Entity Reevaluation")
 
-# Toggle this to True if you want to simulate responses without hitting backend
 MOCK_MODE = False
-
-# Network tuning
-REQUEST_TIMEOUT = 40     # seconds
+REQUEST_TIMEOUT = 40
 MAX_RETRIES = 3
 BACKOFF_SECONDS = 1.25
 
@@ -29,12 +25,9 @@ AUDIT_DIR = "audit_logs"
 os.makedirs(AUDIT_DIR, exist_ok=True)
 
 # ---------------------------------------------
-# HELPERS (mirrors your header build approach)
+# HELPERS
 # ---------------------------------------------
 def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str = "") -> Dict[str, str]:
-    """
-    Matches your previous app's header shape; optional x-tenant-id included if provided.
-    """
     headers = {
         "Content-Type": "application/json",
         "x-rdp-version": "8.1",
@@ -45,14 +38,11 @@ def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str 
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
-    # If your backend also expects tenant as a header (besides subdomain),
-    # keep this; otherwise feel free to remove it.
     if tenant:
         headers["x-tenant-id"] = tenant
     return headers
 
 def sanitize_entity_id(entity_id: str) -> str:
-    """Allow alphanumerics, dash, underscore, colon, dot."""
     return re.sub(r"[^A-Za-z0-9_:\-\.]", "", (entity_id or "").strip())
 
 def audit_path_today() -> str:
@@ -90,12 +80,11 @@ def read_recent_audit(n: int = 20):
         rows = list(csv.DictReader(f))
     return rows[-n:]
 
-# ---------------------------------------------
-# Models
-# ---------------------------------------------
-class ReevaluateRequest(BaseModel):
-    entity: Dict[str, str]
-    requestId: str = Field(default_factory=lambda: str(uuid.uuid4()))
+def make_request_payload(entity_id: str, entity_type: str) -> Dict[str, Any]:
+    return {
+        "entity": {"id": entity_id, "type": entity_type},
+        "requestId": str(uuid.uuid4())
+    }
 
 # ---------------------------------------------
 # Backend client
@@ -108,7 +97,7 @@ class BackendClient:
     def reevaluate(
         self,
         tenant: str,
-        payload: ReevaluateRequest,
+        payload: Dict[str, Any],
         user_id: str,
         client_id: str,
         client_secret: str,
@@ -117,7 +106,6 @@ class BackendClient:
     ) -> Tuple[Dict[str, Any], int, float]:
         """
         POST https://{tenant}.syndigo.com/api/entitygovernservice/reevaluate
-        Body: {"entity": {"id": "...", "type": "..."}}
         """
         start = time.perf_counter()
 
@@ -126,9 +114,9 @@ class BackendClient:
             latency = time.perf_counter() - start
             return {
                 "success": True,
-                "message": f"[MOCK] Reevaluate accepted for {payload.entity.get('id')} ({payload.entity.get('type')})",
+                "message": f"[MOCK] Reevaluate accepted for {payload['entity'].get('id')} ({payload['entity'].get('type')})",
                 "backendRequestId": f"mock-{uuid.uuid4()}",
-                "data": {"echo": {"entity": payload.entity, "requestId": payload.requestId}},
+                "data": {"echo": payload},
             }, 200, latency
 
         if not tenant:
@@ -147,7 +135,7 @@ class BackendClient:
                 r = requests.post(
                     url,
                     headers=headers,
-                    json={"entity": payload.entity},
+                    json={"entity": payload["entity"]},  # only the required body
                     timeout=self.timeout,
                 )
                 last_status = r.status_code
@@ -160,7 +148,6 @@ class BackendClient:
                     latency = time.perf_counter() - start
                     return body, r.status_code, latency
 
-                # Retryable
                 if r.status_code in (429, 500, 502, 503, 504):
                     last_message = f"Retryable error {r.status_code}: {r.text[:300]}"
                     if attempt <= max_retries:
@@ -189,7 +176,7 @@ class BackendClient:
         return {"success": False, "message": last_message}, last_status, latency
 
 # ---------------------------------------------
-# UI — same pattern as your prior Streamlit app
+# UI
 # ---------------------------------------------
 with st.form("reeval_form", clear_on_submit=False):
     st.subheader("🔐 Connection Details")
@@ -205,7 +192,6 @@ with st.form("reeval_form", clear_on_submit=False):
     submitted = st.form_submit_button("Reevaluate", type="primary")
 
 if submitted:
-    # Basic validation (match your previous UX approach)
     if not tenant or not client_id or not client_secret:
         st.error("Please provide Tenant, Client ID, and Client Secret.")
         st.stop()
@@ -216,13 +202,13 @@ if submitted:
         st.error("Both Entity ID and Entity Type are required.")
         st.stop()
 
-    req = ReevaluateRequest(entity={"id": clean_id, "type": clean_type})
+    req_payload = make_request_payload(clean_id, clean_type)
     client = BackendClient(timeout=REQUEST_TIMEOUT, mock=MOCK_MODE)
 
     with st.spinner("Contacting backend..."):
         body, http_status, latency = client.reevaluate(
             tenant=tenant.strip(),
-            payload=req,
+            payload=req_payload,
             user_id=(user_id or "system").strip() or "system",
             client_id=client_id.strip(),
             client_secret=client_secret.strip(),
@@ -246,7 +232,7 @@ if submitted:
             "message": message,
             "backendRequestId": backend_req_id,
             "data": body.get("data"),
-            "request": {"entity": req.entity, "requestId": req.requestId},
+            "request": req_payload,
             "headersUsed": {
                 "x-rdp-version": "8.1",
                 "x-rdp-clientId": "rdpclient",
@@ -257,14 +243,13 @@ if submitted:
             }
         })
 
-    # Audit log row
     write_audit({
         "timestamp_iso": dt.datetime.now().isoformat(timespec="seconds"),
         "tenant": tenant or "",
         "user_id": user_id or "system",
-        "entity_id": req.entity["id"],
-        "entity_type": req.entity["type"],
-        "request_id": req.requestId,
+        "entity_id": req_payload["entity"]["id"],
+        "entity_type": req_payload["entity"]["type"],
+        "request_id": req_payload["requestId"],
         "status": "success" if success else "failure",
         "http_status": http_status,
         "latency_sec": f"{latency:.2f}",
