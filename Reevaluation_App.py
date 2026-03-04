@@ -447,4 +447,4 @@ if recent:
     st.dataframe(recent,use_container_width=True,hide_index=True)
 else:
     st.info("No activity yet today.")
-``
+
