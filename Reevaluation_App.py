@@ -2,9 +2,11 @@ import os
 import time
 import csv
 import uuid
+import io
 import datetime as dt
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 import streamlit as st
 
@@ -19,28 +21,29 @@ MAX_RETRIES     = 3
 BACKOFF         = 1.25
 REEVAL_WORKERS  = 10
 
-MODEL_GET_PATH   = "/api/entitymodelservice/get"
-APP_GET_PATH     = "/api/entityappservice/get"
-CLEAR_SCROLL_PATH= "/api/entityappservice/clearscroll"
-REEVAL_PATH      = "/api/entitygovernservice/reevaluate"
+MODEL_GET_PATH    = "/api/entitymodelservice/get"
+APP_GET_PATH      = "/api/entityappservice/get"
+CLEAR_SCROLL_PATH = "/api/entityappservice/clearscroll"
+REEVAL_PATH       = "/api/entitygovernservice/reevaluate"
 
 AUDIT_DIR = "audit_logs"
 os.makedirs(AUDIT_DIR, exist_ok=True)
+
 
 # ---------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------
 def build_headers(user_id: str, client_id: str, client_secret: str, tenant: str) -> Dict[str, str]:
     return {
-        "Content-Type":      "application/json",
-        "x-rdp-version":     "8.1",
-        "x-rdp-clientId":    "rdpclient",
-        "x-rdp-userId":      user_id or "system",
-        "auth-client-id":    client_id,
-        "auth-client-secret":client_secret,
-        "Cache-Control":     "no-cache",
-        "Pragma":            "no-cache",
-        "x-tenant-id":       tenant
+        "Content-Type":       "application/json",
+        "x-rdp-version":      "8.1",
+        "x-rdp-clientId":     "rdpclient",
+        "x-rdp-userId":       user_id or "system",
+        "auth-client-id":     client_id,
+        "auth-client-secret": client_secret,
+        "Cache-Control":      "no-cache",
+        "Pragma":             "no-cache",
+        "x-tenant-id":        tenant
     }
 
 def post_json(url: str, headers: Dict[str,str], body: Dict[str,Any]) -> (Dict[str,Any], int, float):
@@ -48,7 +51,6 @@ def post_json(url: str, headers: Dict[str,str], body: Dict[str,Any]) -> (Dict[st
     for attempt in range(MAX_RETRIES+1):
         try:
             r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-            # try parse JSON, but guard if body is empty
             try:
                 data = r.json()
             except Exception:
@@ -91,26 +93,37 @@ def fmt_min_sec(seconds: float) -> str:
     s = int(seconds)
     return f"{s//60}m {s%60}s"
 
+def results_to_csv_bytes(rows: List[Dict[str,Any]]) -> bytes:
+    if not rows:
+        return b""
+    out = io.StringIO()
+    fieldnames = list(rows[0].keys())
+    w = csv.DictWriter(out, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return out.getvalue().encode("utf-8")
+
+
 # ---------------------------------------------------------
-# SCROLL-BASED ID FETCH (3-step: prepareScroll → scrollId → clearScroll)
+# SCROLL-BASED ID FETCH (prepareScroll → scrollId paging → clearScroll)
 # ---------------------------------------------------------
 def fetch_all_ids_via_scroll(base: str, headers: Dict[str,str], etype: str) -> List[str]:
     all_ids: List[str] = []
     seen: set = set()
-    latest_scroll: str = ""
+    last_valid_scroll: str = ""
 
-    # STEP 1 — Prepare Scroll (first 2000 + scrollId)
-    body = {
-        "params": {
-            "prepareScroll": True,
-            "query": {
-                "filters": {
-                    "typesCriterion": [etype]
-                }
+    # STEP 1 — Prepare Scroll
+    j, s, _ = post_json(
+        f"{base}{APP_GET_PATH}",
+        headers,
+        {
+            "params": {
+                "prepareScroll": True,
+                "query": { "filters": { "typesCriterion": [etype] } }
             }
         }
-    }
-    j, s, _ = post_json(f"{base}{APP_GET_PATH}", headers, body)
+    )
     if s >= 400:
         return []
 
@@ -118,48 +131,42 @@ def fetch_all_ids_via_scroll(base: str, headers: Dict[str,str], etype: str) -> L
     for i in batch:
         if i not in seen: seen.add(i); all_ids.append(i)
 
-    # The scrollId might be under response.scrollId; use latest every time
     scroll_id = j.get("response", {}).get("scrollId")
 
-    # STEP 2 — Loop with scrollId until no objects found / invalid
-    while scroll_id and isinstance(scroll_id, str) and scroll_id.lower() != "invalid":
-        latest_scroll = scroll_id
-        body = {
-            "params": {
-                "scrollId": scroll_id,
-                "query": {
-                    "filters": {
-                        "typesCriterion": [etype]
-                    }
+    # STEP 2 — Keep requesting with latest scrollId
+    while isinstance(scroll_id, str) and scroll_id and scroll_id.lower() != "invalid":
+        last_valid_scroll = scroll_id
+        j, s, _ = post_json(
+            f"{base}{APP_GET_PATH}",
+            headers,
+            {
+                "params": {
+                    "scrollId": scroll_id,
+                    "query": { "filters": { "typesCriterion": [etype] } }
                 }
             }
-        }
-        j, s, _ = post_json(f"{base}{APP_GET_PATH}", headers, body)
+        )
         if s >= 400:
             break
 
-        # collect ids from this page
+        resp = j.get("response", {}) if isinstance(j, dict) else {}
         batch = extract_ids(j, etype)
         if not batch:
-            # service might already be at the end
-            break
+            break  # end of scroll
 
         for i in batch:
             if i not in seen: seen.add(i); all_ids.append(i)
 
-        # IMPORTANT: scrollId can be regenerated each response; always capture the *latest*
-        scroll_id = j.get("response", {}).get("scrollId")
-
-        # safety: if service starts repeating same scrollId (rare), break to avoid loop
-        if scroll_id == latest_scroll:
+        scroll_id = resp.get("scrollId")
+        if not isinstance(scroll_id, str) or not scroll_id or scroll_id.lower() == "invalid":
             break
 
     # STEP 3 — Clear Scroll (best effort)
-    if latest_scroll and latest_scroll.lower() != "invalid":
-        clear_body = {"params": {"scrollId": latest_scroll}}
-        post_json(f"{base}{CLEAR_SCROLL_PATH}", headers, clear_body)
+    if last_valid_scroll and last_valid_scroll.lower() != "invalid":
+        post_json(f"{base}{CLEAR_SCROLL_PATH}", headers, {"params": {"scrollId": last_valid_scroll}})
 
     return all_ids
+
 
 # ---------------------------------------------------------
 # Re-evaluation worker
@@ -178,6 +185,7 @@ def reeval_worker(base: str, headers: Dict[str,str], iid: str, et: str) -> Dict[
         "request_id": str(uuid.uuid4())
     }
 
+
 # ---------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------
@@ -189,6 +197,7 @@ with st.sidebar:
     client_secret = st.text_input("Client Secret", "", type="password")
 
 BASE_URL = f"https://{tenant}.syndigo.com" if tenant else ""
+
 
 # ---------------------------------------------------------
 # STEP 1 — Discover Entity Types
@@ -206,15 +215,18 @@ if "selected_types" not in st.session_state:
 
 if btn_types:
     headers = build_headers(user_id, client_id, client_secret, tenant)
-    body = {
-        "params": {
-            "query": {
-                "domain": "thing",
-                "filters": {"typesCriterion": ["entityType"]}
+    j, s, _ = post_json(
+        f"{BASE_URL}{MODEL_GET_PATH}",
+        headers,
+        {
+            "params": {
+                "query": {
+                    "domain": "thing",
+                    "filters": { "typesCriterion": ["entityType"] }
+                }
             }
         }
-    }
-    j, s, _ = post_json(f"{BASE_URL}{MODEL_GET_PATH}", headers, body)
+    )
     if s >= 400:
         st.error(f"Failed to fetch types (HTTP {s}).")
     else:
@@ -222,11 +234,11 @@ if btn_types:
         st.success(f"Found {len(st.session_state.types)} types")
 
 if st.session_state.types:
-    st.dataframe([{"entityType": t} for t in st.session_state.types],
-                 use_container_width=True, hide_index=True)
+    st.dataframe([{"entityType": t} for t in st.session_state.types], use_container_width=True, hide_index=True)
+
 
 # ---------------------------------------------------------
-# STEP 2 — Get Counts (optional, used for global progress denominator)
+# STEP 2 — Get Counts (optional for global progress denominator)
 # ---------------------------------------------------------
 st.subheader("② Get Counts per Entity Type")
 btn_counts = st.button("Load counts", disabled=not st.session_state.types)
@@ -236,8 +248,11 @@ if btn_counts:
     out = {}
     prog = st.progress(0.0)
     for i, et in enumerate(st.session_state.types, 1):
-        body = {"params": {"query": {"filters": {"typesCriterion": [et]}}}}
-        j, s, _ = post_json(f"{BASE_URL}{APP_GET_PATH}", headers, body)
+        j, s, _ = post_json(
+            f"{BASE_URL}{APP_GET_PATH}",
+            headers,
+            {"params": {"query": {"filters": {"typesCriterion": [et]}}}}
+        )
         total = j.get("response", {}).get("totalRecords") if s < 400 else None
         out[et] = total
         prog.progress(i/len(st.session_state.types))
@@ -250,21 +265,21 @@ if st.session_state.counts:
         use_container_width=True, hide_index=True
     )
 
+
 # ---------------------------------------------------------
 # STEP 3 — Select Types (safe default cleanup)
 # ---------------------------------------------------------
 st.subheader("③ Select Types")
-
 valid_types = st.session_state.types
-# SAFE DEFAULTS: keep only defaults that exist in options to avoid StreamlitAPIException
 clean_defaults = [x for x in st.session_state.get("selected_types", []) if x in valid_types]
 st.session_state.selected_types = clean_defaults
 
 selected = st.multiselect("Select entity type(s)", valid_types, default=clean_defaults)
 st.session_state.selected_types = selected
 
+
 # ---------------------------------------------------------
-# STEP 4 — Re-evaluation (scroll-based ID retrieval + live progress)
+# STEP 4 — Re-evaluation (scroll-based) + Downloads
 # ---------------------------------------------------------
 st.subheader("④ Re-evaluation")
 btn_start = st.button("Start Re-evaluation", type="primary",
@@ -274,7 +289,6 @@ results: List[Dict[str,Any]] = []
 
 if btn_start:
     headers = build_headers(user_id, client_id, client_secret, tenant)
-
     expected_global = sum((st.session_state.counts.get(et, 0) or 0) for et in selected) if st.session_state.counts else None
     overall = st.progress(0.0)
     status  = st.empty()
@@ -285,18 +299,34 @@ if btn_start:
         for et in selected:
             t0 = time.perf_counter()
 
-            # ------- SCROLL: get ALL IDs for this entity type -------
+            # 1) Get ALL IDs using SCROLL
             ids = fetch_all_ids_via_scroll(BASE_URL, headers, et)
             total = len(ids)
 
             status.info(f"Re-evaluating: {et} — 0/{total} (global {done_global}/{expected_global or '?'})")
 
+            # 2) Schedule re-evals
             futures = [pool.submit(reeval_worker, BASE_URL, headers, iid, et) for iid in ids]
             processed = 0
 
+            # 3) Consume results one-by-one (robust to individual failures)
             for fut in as_completed(futures):
-                res = fut.result()
-                results.append(res)
+                try:
+                    res = fut.result()
+                except Exception as ex:
+                    res = {
+                        "id": "<unknown>",
+                        "success": False,
+                        "latency": 0.0,
+                        "http": 520,
+                        "msg": f"worker exception: {ex}",
+                        "request_id": str(uuid.uuid4())
+                    }
+
+                results.append({
+                    "entityType": et,
+                    **res
+                })
 
                 write_audit({
                     "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
@@ -316,7 +346,6 @@ if btn_start:
                 if denom:
                     overall.progress(min(1.0, done_global/max(1,denom)))
                 else:
-                    # if counts not loaded, keep progress bounded without a denominator
                     overall.progress(0.0 if done_global == 0 else min(1.0, done_global/(done_global+1)))
 
                 status.info(f"Re-evaluating: {et} — {processed}/{total} (global {done_global}/{expected_global or '?'})")
@@ -326,18 +355,42 @@ if btn_start:
 
     st.success("Re-evaluation complete.")
 
-if results:
-    st.subheader("Run Results")
-    results_sorted = sorted(results, key=lambda x: (x["id"]))
-    st.dataframe(results_sorted, use_container_width=True, hide_index=True)
-
+# ---------------------------------------------------------
+# DOWNLOADS & RECENT AUDIT VIEW
+# ---------------------------------------------------------
 st.markdown("---")
-st.subheader("Recent Audit (today)")
-# (Optional) show last 20 rows of today's audit if exists
+st.subheader("Run Results & Audit")
+
+# Download full run results (all rows)
+if results:
+    csv_bytes = results_to_csv_bytes(results)
+    st.download_button(
+        label="⬇️ Download Run Results (CSV)",
+        data=csv_bytes,
+        file_name=f"re_eval_results_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+# Show last 20 audit rows on-screen, but offer full CSV download
 aud_path = os.path.join(AUDIT_DIR, f"audit_{dt.datetime.now().strftime('%Y%m%d')}.csv")
 if os.path.exists(aud_path):
+    with open(aud_path, "rb") as f:
+        full_bytes = f.read()
+
+    # Download full audit (not limited)
+    st.download_button(
+        label="⬇️ Download Today's Audit (full CSV)",
+        data=full_bytes,
+        file_name=os.path.basename(aud_path),
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # Show only the last 20 rows in the table
     with open(aud_path, "r", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
+    st.caption(f"Showing last {min(20, len(rows))} audit rows (download above contains all).")
     st.dataframe(rows[-20:], use_container_width=True, hide_index=True)
 else:
     st.info("No activity yet today.")
