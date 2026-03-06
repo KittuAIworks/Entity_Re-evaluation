@@ -20,6 +20,7 @@ REQUEST_TIMEOUT = 40
 MAX_RETRIES     = 3
 BACKOFF         = 1.25
 REEVAL_WORKERS  = 10
+SCROLL_PAGE_SIZE = 2000   # ensure we always pull up to 2000 per scroll page
 
 MODEL_GET_PATH    = "/api/entitymodelservice/get"
 APP_GET_PATH      = "/api/entityappservice/get"
@@ -28,7 +29,6 @@ REEVAL_PATH       = "/api/entitygovernservice/reevaluate"
 
 AUDIT_DIR = "audit_logs"
 os.makedirs(AUDIT_DIR, exist_ok=True)
-
 
 # ---------------------------------------------------------
 # HELPERS
@@ -104,7 +104,6 @@ def results_to_csv_bytes(rows: List[Dict[str,Any]]) -> bytes:
         w.writerow(r)
     return out.getvalue().encode("utf-8")
 
-
 # ---------------------------------------------------------
 # SCROLL-BASED ID FETCH (prepareScroll → scrollId paging → clearScroll)
 # ---------------------------------------------------------
@@ -113,14 +112,15 @@ def fetch_all_ids_via_scroll(base: str, headers: Dict[str,str], etype: str) -> L
     seen: set = set()
     last_valid_scroll: str = ""
 
-    # STEP 1 — Prepare Scroll
+    # STEP 1 — Prepare Scroll (include maxRecords)
     j, s, _ = post_json(
         f"{base}{APP_GET_PATH}",
         headers,
         {
             "params": {
                 "prepareScroll": True,
-                "query": { "filters": { "typesCriterion": [etype] } }
+                "query": { "filters": { "typesCriterion": [etype] } },
+                "options": { "maxRecords": SCROLL_PAGE_SIZE }
             }
         }
     )
@@ -133,7 +133,7 @@ def fetch_all_ids_via_scroll(base: str, headers: Dict[str,str], etype: str) -> L
 
     scroll_id = j.get("response", {}).get("scrollId")
 
-    # STEP 2 — Keep requesting with latest scrollId
+    # STEP 2 — Keep requesting with latest scrollId (always include maxRecords)
     while isinstance(scroll_id, str) and scroll_id and scroll_id.lower() != "invalid":
         last_valid_scroll = scroll_id
         j, s, _ = post_json(
@@ -142,7 +142,8 @@ def fetch_all_ids_via_scroll(base: str, headers: Dict[str,str], etype: str) -> L
             {
                 "params": {
                     "scrollId": scroll_id,
-                    "query": { "filters": { "typesCriterion": [etype] } }
+                    "query": { "filters": { "typesCriterion": [etype] } },
+                    "options": { "maxRecords": SCROLL_PAGE_SIZE }
                 }
             }
         )
@@ -167,7 +168,6 @@ def fetch_all_ids_via_scroll(base: str, headers: Dict[str,str], etype: str) -> L
 
     return all_ids
 
-
 # ---------------------------------------------------------
 # Re-evaluation worker
 # ---------------------------------------------------------
@@ -185,7 +185,6 @@ def reeval_worker(base: str, headers: Dict[str,str], iid: str, et: str) -> Dict[
         "request_id": str(uuid.uuid4())
     }
 
-
 # ---------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------
@@ -197,7 +196,6 @@ with st.sidebar:
     client_secret = st.text_input("Client Secret", "", type="password")
 
 BASE_URL = f"https://{tenant}.syndigo.com" if tenant else ""
-
 
 # ---------------------------------------------------------
 # STEP 1 — Discover Entity Types
@@ -236,9 +234,8 @@ if btn_types:
 if st.session_state.types:
     st.dataframe([{"entityType": t} for t in st.session_state.types], use_container_width=True, hide_index=True)
 
-
 # ---------------------------------------------------------
-# STEP 2 — Get Counts (optional for global progress denominator)
+# STEP 2 — Get Counts (optional)
 # ---------------------------------------------------------
 st.subheader("② Get Counts per Entity Type")
 btn_counts = st.button("Load counts", disabled=not st.session_state.types)
@@ -265,18 +262,24 @@ if st.session_state.counts:
         use_container_width=True, hide_index=True
     )
 
-
 # ---------------------------------------------------------
-# STEP 3 — Select Types (safe default cleanup)
+# STEP 3 — Select Types (safe default cleanup + SELECT ALL)
 # ---------------------------------------------------------
 st.subheader("③ Select Types")
-valid_types = st.session_state.types
-clean_defaults = [x for x in st.session_state.get("selected_types", []) if x in valid_types]
-st.session_state.selected_types = clean_defaults
 
-selected = st.multiselect("Select entity type(s)", valid_types, default=clean_defaults)
+col1, col2 = st.columns([4, 1])
+with col1:
+    valid_types = st.session_state.types
+    clean_defaults = [x for x in st.session_state.get("selected_types", []) if x in valid_types]
+    st.session_state.selected_types = clean_defaults
+
+    selected = st.multiselect("Select entity type(s)", valid_types, default=clean_defaults)
+with col2:
+    sel_all = st.checkbox("Select all", value=(len(selected) == len(st.session_state.types) and len(selected) > 0))
+    if sel_all:
+        selected = st.session_state.types[:]
+
 st.session_state.selected_types = selected
-
 
 # ---------------------------------------------------------
 # STEP 4 — Re-evaluation (scroll-based) + Downloads
@@ -299,7 +302,7 @@ if btn_start:
         for et in selected:
             t0 = time.perf_counter()
 
-            # 1) Get ALL IDs using SCROLL
+            # 1) Get ALL IDs using SCROLL (now with maxRecords=2000 every time)
             ids = fetch_all_ids_via_scroll(BASE_URL, headers, et)
             total = len(ids)
 
@@ -353,8 +356,6 @@ if btn_start:
             elapsed = time.perf_counter() - t0
             st.success(f"[{et}] Completed re-evaluation for {processed} entities in {fmt_min_sec(elapsed)}.")
 
-    st.success("Re-evaluation complete.")
-
 # ---------------------------------------------------------
 # DOWNLOADS & RECENT AUDIT VIEW
 # ---------------------------------------------------------
@@ -387,7 +388,7 @@ if os.path.exists(aud_path):
         use_container_width=True
     )
 
-    # Show only the last 20 rows in the table
+    # Show only the last 20 rows in the table (per your preference)
     with open(aud_path, "r", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     st.caption(f"Showing last {min(20, len(rows))} audit rows (download above contains all).")
